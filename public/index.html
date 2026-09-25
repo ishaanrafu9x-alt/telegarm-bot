@@ -253,7 +253,7 @@ button{font:inherit}
 var tg = null;
 try { tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null; if(tg) tg.ready(); } catch(e){}
 
-var API='https://telegram-bot-app.jehranrafu-bot2026.workers.dev/api';
+var API='/api';
 var topics=[];
 var unlocked={};
 var userHistory=[];
@@ -531,9 +531,6 @@ function openSingleById(id){
     });
 }
 
-var unlockExpiresAt={}; // topicId -> ms timestamp when that unlock's 30-min window ends
-var relockTimer=null;
-
 function loadUnlocked(){
   var uid=userId();
   if(!uid){renderHome();return Promise.resolve();}
@@ -545,56 +542,10 @@ function loadUnlocked(){
       (data.topics||[]).forEach(function(id){unlocked[id]=true});
       userHistory=Array.isArray(data.history)?data.history:(data.topics||[]);
       window.adProgress=Object.assign({},data.adProgress||{});
-      unlockExpiresAt=data.expiresAt||{};
-      scheduleLocalRelockCheck();
       renderHome();
       var singleVisible=document.getElementById('singleView').style.display==='block';
       if(currentTopic&&singleVisible)renderSingle(currentTopic);
     }).catch(function(){renderHome()});
-}
-
-// 🐛 FIX (the real Firestore-quota-at-scale problem — NOT the ad/unlock
-// flow): the app used to poll `/api/user-unlocked/:userId` (1 Firestore
-// read) every 60 SECONDS for every single open Mini App instance, purely to
-// notice when a 30-minute unlock window ended — completely independent of
-// how many ads anyone actually watched. At real scale (hundreds/thousands
-// of people just sitting with the app open) that alone burns through a
-// daily read quota in minutes. The server already tells us exactly WHEN
-// each unlock expires (`expiresAt`) on the one read we already do — so
-// instead of asking again and again "has it expired yet?", just set a
-// local timer for the exact moment it will, and relock in the UI right
-// then with ZERO extra server calls. The periodic server poll below is now
-// only a rare safety net (clock drift, missed timers), not how expiry is
-// actually detected.
-function scheduleLocalRelockCheck(){
-  if(relockTimer){clearTimeout(relockTimer);relockTimer=null;}
-  var now=Date.now();
-  var soonest=null;
-  Object.keys(unlockExpiresAt).forEach(function(topicId){
-    var at=Number(unlockExpiresAt[topicId]);
-    if(Number.isFinite(at) && at>now && (soonest===null || at<soonest)) soonest=at;
-  });
-  if(soonest===null) return; // nothing currently unlocked — nothing to schedule
-  var delay=Math.max(500,soonest-now+250); // small buffer past the exact boundary
-  relockTimer=setTimeout(function(){
-    relockTimer=null;
-    var now2=Date.now();
-    var changed=false;
-    Object.keys(unlockExpiresAt).forEach(function(topicId){
-      var at=Number(unlockExpiresAt[topicId]);
-      if(Number.isFinite(at) && at<=now2 && unlocked[topicId]){
-        delete unlocked[topicId];
-        delete unlockExpiresAt[topicId];
-        changed=true;
-      }
-    });
-    if(changed){
-      renderHome();
-      var singleVisible=document.getElementById('singleView').style.display==='block';
-      if(currentTopic&&singleVisible)renderSingle(currentTopic);
-    }
-    scheduleLocalRelockCheck(); // re-arm for the next-soonest expiry, if any
-  },delay);
 }
 
 function loadHome(){
@@ -648,23 +599,9 @@ document.addEventListener('visibilitychange',function(){
   if(document.visibilityState==='visible') syncRotationOnResume();
 });
 
-// Safety net only (clock drift, a missed local timer, another device
-// unlocking something) — actual relocking is now handled instantly and
-// locally by scheduleLocalRelockCheck() above with zero server calls, so
-// this can be far less frequent than before (was every 60s, then every 5min).
-//
-// 🐛 FIX (real remaining Firestore-quota drain at scale): this timer used to
-// keep firing every 5 minutes even while the Mini App was minimized/in the
-// background — Telegram's WebView does NOT suspend JS timers just because
-// the user switched to another chat, so anyone who opened the app and left
-// it running in the background all day was silently costing 1 Firestore
-// read every 5 minutes for the ENTIRE time it sat backgrounded, for zero
-// benefit (nothing is shown to them while it's not visible). At real user
-// counts this "invisible" background polling — not the ad/unlock flow
-// itself — is what was actually burning through the daily quota. Now it
-// only runs while the tab is actually visible, and at 15 minutes instead of
-// 5 (4x fewer calls again on top of that), since it's genuinely just a
-// clock-drift/multi-device safety net.
+// Keep the Mini App UI in sync with the server-side 30-minute access window.
+// The server is the source of truth; this only refreshes the display so an
+// already-open app relocks a topic automatically when its 30-minute window ends.
 setInterval(function(){
   if(document.visibilityState==='visible' && !isWatching && userId()) loadUnlocked().catch(function(){});
 }, 15 * 60 * 1000);
@@ -863,7 +800,7 @@ async function recordAd(button,token){
       return;
     }
     if(!r.ok||!data.success)throw new Error(data.error||'failed');
-    
+    if(data.requiresStart && data.startUrl){
       isWatching=false;
       // Update the button + refresh unlocked state FIRST — if the redirect
       // below doesn't actually leave the Mini App (this can silently do
@@ -871,26 +808,19 @@ async function recordAd(button,token){
       // itself, rather than from a channel post — same chat, so there's
       // nothing to "switch" to), the user should still see "CONTENT
       // UNLOCKED" instead of being stuck on "Preparing Ad…" forever.
-      if(button)button.textContent='CONTif(data.requiresStart && data.startUrl){
-  isWatching=false;
-  if(button)button.textContent='CONTENT UNLOCKED';
-  loadUnlocked();
-  var alreadyLeft=false;
-  function forceLeave(){
-    if(alreadyLeft)return;
-    alreadyLeft=true;
-    window.location.href=data.startUrl;
-  }
-  try{
-    if(tg && tg.openTelegramLink){ tg.openTelegramLink(data.startUrl); }
-  }catch(e){ console.error('openTelegramLink error:',e); }
-  setTimeout(function(){
-    try{ if(tg && tg.close){ tg.close(); } }
-    catch(e){ console.error('tg.close error:',e); }
-    setTimeout(forceLeave,500);
-  },300);
-  return;
-}
+      if(button)button.textContent='CONTENT UNLOCKED';
+      loadUnlocked();
+      try{
+        if(tg && tg.openTelegramLink){
+          tg.openTelegramLink(data.startUrl);
+          // Force the Mini App itself to close so Telegram is forced to bring
+          // the bot chat to the front — this is what actually triggers the
+          // "new message" notification. openTelegramLink alone can silently
+          // no-op when the target is the same chat the Mini App was launched
+          // from (i.e. opened via the bot's own Menu Button).
+          if(tg.close) setTimeout(function(){tg.close()},300);
+        } else {
+          window.location.href=data.startUrl;
         }
       }catch(redirectError){
         // If openTelegramLink itself throws (older client versions, odd
