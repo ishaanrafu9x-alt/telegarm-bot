@@ -863,7 +863,7 @@ async function recordAd(button,token){
       return;
     }
     if(!r.ok||!data.success)throw new Error(data.error||'failed');
-    if(data.requiresStart && data.startUrl){
+    
       isWatching=false;
       // Update the button + refresh unlocked state FIRST — if the redirect
       // below doesn't actually leave the Mini App (this can silently do
@@ -871,19 +871,26 @@ async function recordAd(button,token){
       // itself, rather than from a channel post — same chat, so there's
       // nothing to "switch" to), the user should still see "CONTENT
       // UNLOCKED" instead of being stuck on "Preparing Ad…" forever.
-      if(button)button.textContent='CONTENT UNLOCKED';
-      loadUnlocked();
-      try{
-        if(tg && tg.openTelegramLink){
-          tg.openTelegramLink(data.startUrl);
-          // Force the Mini App itself to close so Telegram is forced to bring
-          // the bot chat to the front — this is what actually triggers the
-          // "new message" notification. openTelegramLink alone can silently
-          // no-op when the target is the same chat the Mini App was launched
-          // from (i.e. opened via the bot's own Menu Button).
-          if(tg.close) setTimeout(function(){tg.close()},300);
-        } else {
-          window.location.href=data.startUrl;
+      if(button)button.textContent='CONTif(data.requiresStart && data.startUrl){
+  isWatching=false;
+  if(button)button.textContent='CONTENT UNLOCKED';
+  loadUnlocked();
+  var alreadyLeft=false;
+  function forceLeave(){
+    if(alreadyLeft)return;
+    alreadyLeft=true;
+    window.location.href=data.startUrl;
+  }
+  try{
+    if(tg && tg.openTelegramLink){ tg.openTelegramLink(data.startUrl); }
+  }catch(e){ console.error('openTelegramLink error:',e); }
+  setTimeout(function(){
+    try{ if(tg && tg.close){ tg.close(); } }
+    catch(e){ console.error('tg.close error:',e); }
+    setTimeout(forceLeave,500);
+  },300);
+  return;
+}
         }
       }catch(redirectError){
         // If openTelegramLink itself throws (older client versions, odd
