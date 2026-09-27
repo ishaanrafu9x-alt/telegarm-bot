@@ -4154,16 +4154,26 @@ app.post('/api/ad-complete', async (req, res) => {
     const token = String(req.body.token || '').trim();
     if (!userId || !topicId) return res.status(400).json({ error: 'userId and topicId are required' });
 
-    // 🛡️ Require a valid, matching, not-yet-used ad-start token that's old
-    // enough to correspond to a real ad view (see AD_TOKEN_TTL_MS / MIN_AD_DURATION_MS).
-    const tokenData = adTokens.get(token);
-    if (!tokenData || tokenData.userId !== userId || tokenData.topicId !== topicId) {
-      return res.status(400).json({ success: false, error: '❌ Ad session verify করা যায়নি। আবার Ad দেখুন।' });
+    // 👑 VIP direct-unlock path: VIP users never start an ad session, so they
+    // legitimately arrive here without a token. Only allow the tokenless path
+    // when the user's active subscription proves VIP status. Normal users still
+    // require the short-lived, single-use ad token exactly as before.
+    let tokenlessVip = false;
+    if (!token) {
+      const vipSnap = await db.collection('users').doc(userId).get();
+      const vipData = vipSnap.exists ? vipSnap.data() : {};
+      tokenlessVip = Number(vipData.subscriptionExpiresAt) > Date.now();
+      if (!tokenlessVip) return res.status(400).json({ success: false, error: '❌ Ad session verify করা যায়নি। আবার Ad দেখুন।' });
+    } else {
+      const tokenData = adTokens.get(token);
+      if (!tokenData || tokenData.userId !== userId || tokenData.topicId !== topicId) {
+        return res.status(400).json({ success: false, error: '❌ Ad session verify করা যায়নি। আবার Ad দেখুন।' });
+      }
+      if ((Date.now() - tokenData.createdAt) < MIN_AD_DURATION_MS) {
+        return res.status(400).json({ success: false, error: '❌ Ad সম্পূর্ণ না দেখেই সম্পন্ন দেখানো হয়েছে বলে মনে হচ্ছে। আবার চেষ্টা করুন।' });
+      }
+      adTokens.delete(token); // single-use
     }
-    if ((Date.now() - tokenData.createdAt) < MIN_AD_DURATION_MS) {
-      return res.status(400).json({ success: false, error: '❌ Ad সম্পূর্ণ না দেখেই সম্পন্ন দেখানো হয়েছে বলে মনে হচ্ছে। আবার চেষ্টা করুন।' });
-    }
-    adTokens.delete(token); // single-use
 
     // Use the shared topic cache/request coalescer. This removes a hot-path
     // Firestore read for every completed ad while keeping topic settings fresh
@@ -4367,8 +4377,8 @@ app.post('/api/ad-complete', async (req, res) => {
           // Every unlock (not just the first) should take the user into the
           // bot chat so they actually see the video land, instead of the
           // delivery happening silently in the background.
-          requiresStart: !!directStartUrl,
-          startUrl: directStartUrl || undefined
+          requiresStart: false,
+          chatUrl: directStartUrl || undefined
         });
       } catch (deliveryError) {
         if (deliveryError.message === 'NOT_STARTED') {
@@ -4420,8 +4430,8 @@ app.post('/api/ad-complete', async (req, res) => {
           unlocked: true,
           directDelivered: false,
           deliveryError: true,
-          requiresStart: !!directStartUrl,
-          startUrl: directStartUrl || undefined
+          requiresStart: false,
+          chatUrl: directStartUrl || undefined
         });
       }
     }
