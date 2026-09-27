@@ -635,6 +635,7 @@ let topicSearchData = {};
 let appendVideoData = {};
 let duplicateTopicData = {};
 let channelPickData = {};
+let vipSubData = {}; // 👑 VIP subscription admin flow: {step:'userId'|'duration'|'customDays', targetId}
 
 // Isolate admin workflows. Add Video/Topic always has priority over /post.
 function clearAdminWorkflow(userId) {
@@ -653,6 +654,7 @@ function clearAdminWorkflow(userId) {
   delete appendVideoData[userId];
   delete duplicateTopicData[userId];
   delete channelPickData[userId];
+  delete vipSubData[userId];
 }
 function startAddVideoWorkflow(userId) {
   clearAdminWorkflow(userId);
@@ -974,7 +976,8 @@ async function sendAdminPanel(ctx, edit = false) {
     [Markup.button.callback('👥 Users', 'adm_users'), Markup.button.callback('📺 Ads', 'adm_ads')],
     [Markup.button.callback('📣 Broadcast', 'adm_broadcast'), Markup.button.callback('🔘 Post Buttons', 'adm_buttons')],
     [Markup.button.callback('💰 Revenue', 'adm_revenue'), Markup.button.callback('📦 Export Data', 'adm_export')],
-    [Markup.button.callback('🕒 Scheduled Posts', 'adm_scheduled')]
+    [Markup.button.callback('🕒 Scheduled Posts', 'adm_scheduled')],
+    [Markup.button.callback('👑 VIP Subscription', 'adm_vip')]
   ]);
   if (edit && ctx.callbackQuery?.message) {
     return ctx.editMessageText(text, keyboard).catch(() => ctx.reply(text, keyboard));
@@ -1500,7 +1503,7 @@ bot.command('cancel', async (ctx) => {
     postData[userId] || repostData[userId] || adminChannelData[userId] ||
     adminButtonData[userId] || adminVideoData[userId] || userSearchData[userId] ||
     forwardRepostData[userId] || topicSearchData[userId] || appendVideoData[userId] ||
-    duplicateTopicData[userId] || channelPickData[userId]
+    duplicateTopicData[userId] || channelPickData[userId] || vipSubData[userId]
   );
   clearAdminWorkflow(userId);
   delete addTopicData[userId];
@@ -2095,6 +2098,11 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   try { await ctx.answerCbQuery(); } catch (e) {}
   try {
   if (action === 'home') return sendAdminPanel(ctx, true);
+  if (action === 'vip') {
+    clearAdminWorkflow(ctx.from.id);
+    vipSubData[ctx.from.id] = { step: 'userId' };
+    return ctx.reply('👑 VIP SUBSCRIPTION\n\nযে User-কে VIP করতে চান (এই সময়ে Ad ছাড়াই unlock করতে পারবে) তার Telegram User ID পাঠান:');
+  }
   if (action === 'videos') {
     return ctx.editMessageText('🎬 VIDEO MANAGEMENT\n\nএখানে শুধু Video/Topic-এর নিজস্ব management থাকবে।\nPost ও Ads আলাদা Admin menu থেকে করা যাবে।', Markup.inlineKeyboard([
       [Markup.button.callback('➕ Add Video', 'adm_add_video'), Markup.button.callback('📚 Add Topic', 'adm_add_topic')],
@@ -2368,6 +2376,25 @@ bot.action(/^av_delete_confirm:(.+)$/, async ctx=>{
   return ctx.editMessageText('✅ Video/Topic delete হয়েছে।', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'adm_list')]]));
 });
 bot.action(/^apost_topic:(.+)$/, async ctx=>{ if(!adminOnly(ctx))return ctx.answerCbQuery('❌'); const topicId=ctx.match[1]; channelPickData[ctx.from.id]={mode:'topic_post',topicId,selected:new Set()}; await ctx.answerCbQuery(); return renderChannelPicker(ctx); });
+bot.action(/^vipdays:(\d+|custom)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌');
+  const state = vipSubData[ctx.from.id];
+  if (!state || state.step !== 'duration') {
+    await ctx.answerCbQuery('❌ Session হারিয়ে গেছে, আবার শুরু করুন।');
+    return sendAdminPanel(ctx, true);
+  }
+  const choice = ctx.match[1];
+  await ctx.answerCbQuery();
+  if (choice === 'custom') {
+    vipSubData[ctx.from.id] = { step: 'customDays', targetId: state.targetId };
+    return ctx.reply('✏️ কতদিন? সংখ্যা লিখে পাঠান (যেমন: 45):');
+  }
+  const days = Number(choice);
+  const targetId = state.targetId;
+  delete vipSubData[ctx.from.id];
+  return grantVipSubscription(ctx, targetId, days);
+});
+
 bot.action(/^apostch_topic:([^:]+):(.+)$/, async ctx=>{ if(!adminOnly(ctx))return ctx.answerCbQuery('❌'); delete adminVideoData[ctx.from.id]; let ch=ctx.match[1]; const doc=await db.collection('channels').doc(ch).get(); if(doc.exists)ch=doc.data().channelId; const topicId=ctx.match[2]; const td=await db.collection('topics').doc(topicId).get(); if(!td.exists)return ctx.answerCbQuery('❌ Video নেই'); const t=td.data(); const fileId=(t.videos&&t.videos[0])||t.videoId||''; if(!fileId)return ctx.answerCbQuery('❌ Video file পাওয়া যায়নি'); const kb=await buildConfiguredPostKeyboard(topicId); await ctx.answerCbQuery('Posting...'); try{const sent=await bot.telegram.sendVideo(ch,fileId,{caption:t.title||'',reply_markup:kb.reply_markup}); await recordTopicPost(topicId,ch,sent.message_id,'video',t.title||'',t.title||''); return ctx.reply(`✅ Post হয়েছে\n📢 ${ch}\n🆔 Message ID: ${sent.message_id}`, { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup });}catch(e){return ctx.reply('❌ Channel-এ post করা যায়নি: '+e.message);} });
 
 // =============================================
@@ -3148,6 +3175,28 @@ bot.on('text', async (ctx) => {
     );
   }
 
+  // 👑 VIP subscription admin flow — isolated steps, own state object.
+  if (vipSubData[userId] && vipSubData[userId].step === 'userId') {
+    const targetId = text.replace(/\D/g, '');
+    if (!targetId) return ctx.reply('❌ সঠিক Telegram User ID দিন (শুধু সংখ্যা):');
+    vipSubData[userId] = { step: 'duration', targetId };
+    return ctx.reply(
+      `👤 Target User: <code>${targetId}</code>\n\nকতদিনের জন্য Ad ছাড়া unlock করতে দেবেন?`,
+      { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+        [Markup.button.callback('7 দিন', 'vipdays:7'), Markup.button.callback('15 দিন', 'vipdays:15'), Markup.button.callback('30 দিন', 'vipdays:30')],
+        [Markup.button.callback('✏️ Custom দিন', 'vipdays:custom')],
+        [Markup.button.callback('❌ Cancel', 'adm_home')]
+      ]) }
+    );
+  }
+  if (vipSubData[userId] && vipSubData[userId].step === 'customDays') {
+    const days = Number.parseInt(text, 10);
+    if (!Number.isInteger(days) || days < 1) return ctx.reply('❌ ১ বা তার বেশি একটি সংখ্যা দিন:');
+    const targetId = vipSubData[userId].targetId;
+    delete vipSubData[userId];
+    return grantVipSubscription(ctx, targetId, days);
+  }
+
   // Add Video/Topic text steps have priority over every other admin state.
   if (addTopicData[userId]) {
     const data = addTopicData[userId];
@@ -3889,13 +3938,17 @@ app.get('/api/user-unlocked/:userId', async (req, res) => {
     // history (watchedTopicIds) is merged in for the Mini App suggestions.
     const watchedIds = Array.isArray(data.watchedTopicIds) ? data.watchedTopicIds : [];
     const history = Array.from(new Set([...watchedIds, ...unlockedTopics]));
+    // 👑 VIP: same field worker.js reads — no extra read here, this doc is
+    // already fetched above.
+    const isVip = Number(data.subscriptionExpiresAt) > Date.now();
     res.json({
       topics: activeUnlocked,
       history,
       expiresAt,
       adProgress: data.adProgress || {},
       dailyLimit,
-      dailyUsed
+      dailyUsed,
+      isVip
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -4131,6 +4184,22 @@ app.post('/api/ad-complete', async (req, res) => {
       const data = snap.exists ? snap.data() : {};
       if (data.blocked === true) {
         return { blocked: true };
+      }
+      // 👑 VIP: admin-granted ad-free window (see grantVipSubscription /
+      // subscriptionExpiresAt). This is the legacy Express /api/ad-complete
+      // (the live path is now worker.js), kept in sync so VIP still works
+      // if the Mini App is ever pointed back at this server directly.
+      // Still records the real unlock (unlockedTopics/topicUnlockTime) so
+      // the next /api/user-unlocked call correctly shows it as unlocked —
+      // it just skips the ad-progress counting and daily-ad-count increment
+      // entirely, since no ad was watched.
+      if (Number(data.subscriptionExpiresAt) > Date.now()) {
+        const vipUnlockedTopics = (data.unlockedTopics || []).filter(t => t !== topicId);
+        vipUnlockedTopics.push(topicId);
+        const vipTopicUnlockTime = { ...(data.topicUnlockTime || {}), [topicId]: Date.now() };
+        const vipWatched = Array.from(new Set([...(data.watchedTopicIds || []), topicId])).slice(-300);
+        tx.set(userRef, { unlockedTopics: vipUnlockedTopics, topicUnlockTime: vipTopicUnlockTime, watchedTopicIds: vipWatched }, { merge: true });
+        return { count: required, required, unlocked: true, limitReached: false, dailyUsed: Number(data.dailyAdsUsed) || 0, adViewCounted: false, userState: { blocked: false, unlockedTopics: vipUnlockedTopics, topicUnlockTime: vipTopicUnlockTime, sentMessages: data.sentMessages, watchedTopicIds: vipWatched } };
       }
       const progress = { ...(data.adProgress || {}) };
       let unlockedTopics = data.unlockedTopics || [];
@@ -4406,6 +4475,110 @@ if (SELF_URL) {
 // while the server happened to be restarting (timers don't survive that).
 // =============================================
 const scheduledTimers = new Map(); // docId -> Node timeout handle
+
+// 👑 VIP SUBSCRIPTIONS — admin-granted, ad-free unlock windows.
+// Same design as the scheduledPosts timer system right above: an in-memory
+// setTimeout does the real-time work (zero recurring Firestore cost), a
+// one-time startup scan recovers from a restart, and a lightweight query
+// piggybacked on the existing 30-min safety-net cron below catches the rare
+// case where even that startup scan was missed.
+const vipTimers = new Map(); // userId (string) -> Node timeout handle
+
+function armVipTimer(userId, expiresAt) {
+  const key = String(userId);
+  const existing = vipTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const delayMs = expiresAt - Date.now();
+  if (delayMs <= 0) {
+    expireVipSubscription(key).catch(e => console.error('❌ expireVipSubscription error:', e.message));
+    return;
+  }
+  const chunk = Math.min(delayMs, MAX_TIMEOUT_MS);
+  const remaining = delayMs - chunk;
+  const handle = setTimeout(() => {
+    if (remaining > 0) armVipTimer(key, expiresAt);
+    else expireVipSubscription(key).catch(e => console.error('❌ expireVipSubscription error:', e.message));
+  }, chunk);
+  vipTimers.set(key, handle);
+}
+
+// Grants or EXTENDS a VIP subscription — if one is already active, the new
+// days are added on top of the existing expiry (10 days left + 15 more =
+// 25 days from now), never replacing it outright. Only ever triggered by a
+// human admin action (not a per-user hot path), so the one extra Firestore
+// read here is a non-issue for the request-volume optimizations that matter
+// for real traffic.
+async function grantVipSubscription(ctx, userId, days) {
+  try {
+    const userRef = db.collection('users').doc(String(userId));
+    const now = Date.now();
+    const addMs = days * 24 * 60 * 60 * 1000;
+    const newExpiry = await db.runTransaction(async tx => {
+      const snap = await tx.get(userRef);
+      const current = snap.exists ? Number(snap.data().subscriptionExpiresAt) || 0 : 0;
+      const base = current > now ? current : now;
+      const result = base + addMs;
+      tx.set(userRef, { subscriptionExpiresAt: result }, { merge: true });
+      return result;
+    });
+    armVipTimer(userId, newExpiry);
+    const dateStr = new Date(newExpiry).toLocaleString('bn-BD', { timeZone: 'Asia/Dhaka', dateStyle: 'medium', timeStyle: 'short' });
+    return ctx.reply(
+      `✅ VIP Subscription active করা হয়েছে!\n\n👤 User ID: <code>${userId}</code>\n➕ যোগ হয়েছে: ${days} দিন\n⏰ মেয়াদ শেষ হবে: ${dateStr}\n\nএই সময়ে এই user কোনো Ad ছাড়াই ভিডিও unlock করতে পারবে।`,
+      { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]) }
+    );
+  } catch (error) {
+    console.error('❌ grantVipSubscription error:', error.message);
+    return ctx.reply('❌ VIP Subscription সেট করতে সমস্যা হয়েছে: ' + error.message);
+  }
+}
+
+// Fires when a VIP subscription's timer runs out. Re-checks the stored
+// expiry first — if the admin extended it again in the meantime (this timer
+// was armed for the OLD expiry before the extension), this just re-arms for
+// the new time instead of cutting the user off early.
+async function expireVipSubscription(userId) {
+  const key = String(userId);
+  vipTimers.delete(key);
+  try {
+    const userRef = db.collection('users').doc(key);
+    const snap = await userRef.get();
+    if (!snap.exists) return;
+    const expiresAt = Number(snap.data().subscriptionExpiresAt) || 0;
+    if (!expiresAt) return; // already cleared by an earlier run
+    if (expiresAt > Date.now()) { armVipTimer(key, expiresAt); return; }
+    await userRef.set({ subscriptionExpiresAt: admin.firestore.FieldValue.delete() }, { merge: true });
+    if (ADMIN_ID) {
+      await safeSendMessage(
+        ADMIN_ID,
+        `⏰ VIP Subscription শেষ হয়ে গেছে\n\n👤 User ID: <code>${key}</code>\n\nএখন থেকে এই user আবার স্বাভাবিকভাবে Ad দেখে unlock করবে।`,
+        { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup }
+      ).catch(() => {});
+    }
+  } catch (error) {
+    console.error('❌ expireVipSubscription error:', error.message);
+  }
+}
+
+// On boot: re-arm timers for every currently-active VIP subscription
+// (covers a Render restart losing the in-memory timers above), and
+// immediately expire anything that already lapsed while the server was
+// down. Mirrors recoverScheduledPosts() below — a ONE-TIME read at startup,
+// not a recurring cost.
+(async function recoverVipSubscriptions() {
+  try {
+    const snap = await db.collection('users').where('subscriptionExpiresAt', '>', 0).get();
+    const now = Date.now();
+    snap.docs.forEach(doc => {
+      const expiresAt = Number(doc.data().subscriptionExpiresAt) || 0;
+      if (!expiresAt) return;
+      if (expiresAt <= now) expireVipSubscription(doc.id).catch(e => console.error('❌ expireVipSubscription error:', e.message));
+      else armVipTimer(doc.id, expiresAt);
+    });
+  } catch (error) {
+    console.error('❌ recoverVipSubscriptions error:', error.message);
+  }
+})();
 const MAX_TIMEOUT_MS = 20 * 24 * 60 * 60 * 1000; // Node setTimeout overflows past ~24.8 days
 
 async function firePostSchedule(docId) {
@@ -4546,6 +4719,19 @@ cron.schedule('*/30 * * * *', async () => {
     for (const doc of stuckSnap.docs) {
       await doc.ref.set({ status: 'pending' }, { merge: true });
       firePostSchedule(doc.id).catch(e => console.error('❌ firePostSchedule retry error:', e.message));
+    }
+
+    // 👑 VIP subscription safety net — same 5-tick, piggybacked onto this
+    // already-scheduled cron instead of adding a new one, so this costs zero
+    // extra recurring Firestore reads beyond what already runs here.
+    const dueVipSnap = await db.collection('users')
+      .where('subscriptionExpiresAt', '<=', now)
+      .limit(20)
+      .get();
+    for (const doc of dueVipSnap.docs) {
+      if (!vipTimers.has(doc.id)) {
+        expireVipSubscription(doc.id).catch(e => console.error('❌ expireVipSubscription error:', e.message));
+      }
     }
   } catch (error) {
     console.error('❌ Scheduled post safety-net cron error:', error.message);
