@@ -297,6 +297,37 @@ function invalidateTopicsCache() {
   topicsCacheAt = 0;
   singleTopicCache.clear();
   singleTopicRefresh.clear();
+  scheduleTopicsIndexRebuild();
+}
+
+// 🚀 READ-COST FIX: the Cloudflare Worker serves the public topic list. It
+// used to scan the whole `topics` collection (~188 reads) on every cache miss.
+// Now we keep ONE compact doc (`system/topicsIndex`) with the card data
+// (no videos) and rebuild it whenever an admin changes topics (debounced, so
+// bulk edits cost a single rebuild). The Worker reads just that 1 doc.
+let topicsIndexTimer = null;
+function scheduleTopicsIndexRebuild() {
+  if (topicsIndexTimer) clearTimeout(topicsIndexTimer);
+  topicsIndexTimer = setTimeout(() => {
+    topicsIndexTimer = null;
+    rebuildTopicsIndex().catch(e => console.error('❌ topicsIndex rebuild error:', e.message));
+  }, 4000);
+}
+async function rebuildTopicsIndex() {
+  const topics = await getTopicsCached();
+  const cards = topics.map(t => {
+    const { videos, recentUnlocks, lastUnlockAt, dailyUnlockDate, dailyUnlockCount, ...rest } = t;
+    return JSON.parse(JSON.stringify({
+      ...rest,
+      videoCount: Number(t.videoCount) || (Array.isArray(videos) ? videos.length : 0)
+    }));
+  });
+  await db.collection('system').doc('topicsIndex').set({ cards, updatedAt: Date.now() });
+  console.log(`🗂️ topicsIndex rebuilt (${cards.length} topics)`);
+}
+async function ensureTopicsIndex() {
+  const doc = await db.collection('system').doc('topicsIndex').get();
+  if (!doc.exists) await rebuildTopicsIndex();
 }
 
 async function getSingleTopicCached(topicId) {
@@ -4154,26 +4185,16 @@ app.post('/api/ad-complete', async (req, res) => {
     const token = String(req.body.token || '').trim();
     if (!userId || !topicId) return res.status(400).json({ error: 'userId and topicId are required' });
 
-    // 👑 VIP direct-unlock path: VIP users never start an ad session, so they
-    // legitimately arrive here without a token. Only allow the tokenless path
-    // when the user's active subscription proves VIP status. Normal users still
-    // require the short-lived, single-use ad token exactly as before.
-    let tokenlessVip = false;
-    if (!token) {
-      const vipSnap = await db.collection('users').doc(userId).get();
-      const vipData = vipSnap.exists ? vipSnap.data() : {};
-      tokenlessVip = Number(vipData.subscriptionExpiresAt) > Date.now();
-      if (!tokenlessVip) return res.status(400).json({ success: false, error: '❌ Ad session verify করা যায়নি। আবার Ad দেখুন।' });
-    } else {
-      const tokenData = adTokens.get(token);
-      if (!tokenData || tokenData.userId !== userId || tokenData.topicId !== topicId) {
-        return res.status(400).json({ success: false, error: '❌ Ad session verify করা যায়নি। আবার Ad দেখুন।' });
-      }
-      if ((Date.now() - tokenData.createdAt) < MIN_AD_DURATION_MS) {
-        return res.status(400).json({ success: false, error: '❌ Ad সম্পূর্ণ না দেখেই সম্পন্ন দেখানো হয়েছে বলে মনে হচ্ছে। আবার চেষ্টা করুন।' });
-      }
-      adTokens.delete(token); // single-use
+    // 🛡️ Require a valid, matching, not-yet-used ad-start token that's old
+    // enough to correspond to a real ad view (see AD_TOKEN_TTL_MS / MIN_AD_DURATION_MS).
+    const tokenData = adTokens.get(token);
+    if (!tokenData || tokenData.userId !== userId || tokenData.topicId !== topicId) {
+      return res.status(400).json({ success: false, error: '❌ Ad session verify করা যায়নি। আবার Ad দেখুন।' });
     }
+    if ((Date.now() - tokenData.createdAt) < MIN_AD_DURATION_MS) {
+      return res.status(400).json({ success: false, error: '❌ Ad সম্পূর্ণ না দেখেই সম্পন্ন দেখানো হয়েছে বলে মনে হচ্ছে। আবার চেষ্টা করুন।' });
+    }
+    adTokens.delete(token); // single-use
 
     // Use the shared topic cache/request coalescer. This removes a hot-path
     // Firestore read for every completed ad while keeping topic settings fresh
@@ -4377,8 +4398,8 @@ app.post('/api/ad-complete', async (req, res) => {
           // Every unlock (not just the first) should take the user into the
           // bot chat so they actually see the video land, instead of the
           // delivery happening silently in the background.
-          requiresStart: false,
-          chatUrl: directStartUrl || undefined
+          requiresStart: !!directStartUrl,
+          startUrl: directStartUrl || undefined
         });
       } catch (deliveryError) {
         if (deliveryError.message === 'NOT_STARTED') {
@@ -4430,8 +4451,8 @@ app.post('/api/ad-complete', async (req, res) => {
           unlocked: true,
           directDelivered: false,
           deliveryError: true,
-          requiresStart: false,
-          chatUrl: directStartUrl || undefined
+          requiresStart: !!directStartUrl,
+          startUrl: directStartUrl || undefined
         });
       }
     }
@@ -5175,7 +5196,7 @@ app.listen(process.env.PORT || 3000, () => {
   console.log(`🚀 Server running on port ${process.env.PORT || 3000}`);
   // Warm the topics cache immediately so the very first user of a fresh
   // deploy/restart doesn't have to wait on a cold Firestore read.
-  getTopicsCached().catch(() => {});
+  getTopicsCached().then(() => ensureTopicsIndex()).catch(() => {});
 });
 
 // Graceful shutdown — Render restart-এ ঝুলে না যায়
