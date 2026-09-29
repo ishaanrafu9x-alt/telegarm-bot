@@ -2131,8 +2131,31 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   if (action === 'home') return sendAdminPanel(ctx, true);
   if (action === 'vip') {
     clearAdminWorkflow(ctx.from.id);
-    vipSubData[ctx.from.id] = { step: 'userId' };
-    return ctx.reply('👑 VIP SUBSCRIPTION\n\nযে User-কে VIP করতে চান (এই সময়ে Ad ছাড়াই unlock করতে পারবে) তার Telegram User ID পাঠান:');
+    return ctx.reply('👑 VIP SUBSCRIPTION', Markup.inlineKeyboard([
+      [Markup.button.callback('➕ Add / Extend', 'adm_vip_add')],
+      [Markup.button.callback('🔧 দিন নির্দিষ্ট করে বসান', 'adm_vip_set')],
+      [Markup.button.callback('🗑️ VIP বাদ দিন', 'adm_vip_remove')],
+      [Markup.button.callback('📋 VIP List', 'adm_vip_list')],
+      [Markup.button.callback('⬅️ Back', 'adm_home')]
+    ]));
+  }
+  if (action === 'vip_add') {
+    clearAdminWorkflow(ctx.from.id);
+    vipSubData[ctx.from.id] = { step: 'userId', mode: 'add' };
+    return ctx.reply('➕ যে User-কে VIP করতে চান (এখনো VIP থাকলে বর্তমান মেয়াদের সাথে যোগ হবে) তার Telegram User ID পাঠান:');
+  }
+  if (action === 'vip_set') {
+    clearAdminWorkflow(ctx.from.id);
+    vipSubData[ctx.from.id] = { step: 'userId', mode: 'set' };
+    return ctx.reply('🔧 যে User-এর VIP মেয়াদ এখন থেকে ঠিক X দিন বসাতে চান (আগের মেয়াদ বাদ দিয়ে) তার Telegram User ID পাঠান:');
+  }
+  if (action === 'vip_remove') {
+    clearAdminWorkflow(ctx.from.id);
+    vipSubData[ctx.from.id] = { step: 'userId', mode: 'remove' };
+    return ctx.reply('🗑️ যে User-এর VIP বাদ দিতে চান তার Telegram User ID পাঠান:');
+  }
+  if (action === 'vip_list') {
+    return listVipSubscriptions(ctx);
   }
   if (action === 'videos') {
     return ctx.editMessageText('🎬 VIDEO MANAGEMENT\n\nএখানে শুধু Video/Topic-এর নিজস্ব management থাকবে।\nPost ও Ads আলাদা Admin menu থেকে করা যাবে।', Markup.inlineKeyboard([
@@ -2417,13 +2440,14 @@ bot.action(/^vipdays:(\d+|custom)$/, async ctx => {
   const choice = ctx.match[1];
   await ctx.answerCbQuery();
   if (choice === 'custom') {
-    vipSubData[ctx.from.id] = { step: 'customDays', targetId: state.targetId };
+    vipSubData[ctx.from.id] = { step: 'customDays', targetId: state.targetId, mode: state.mode };
     return ctx.reply('✏️ কতদিন? সংখ্যা লিখে পাঠান (যেমন: 45):');
   }
   const days = Number(choice);
   const targetId = state.targetId;
+  const mode = state.mode;
   delete vipSubData[ctx.from.id];
-  return grantVipSubscription(ctx, targetId, days);
+  return mode === 'set' ? setVipSubscription(ctx, targetId, days) : grantVipSubscription(ctx, targetId, days);
 });
 
 bot.action(/^apostch_topic:([^:]+):(.+)$/, async ctx=>{ if(!adminOnly(ctx))return ctx.answerCbQuery('❌'); delete adminVideoData[ctx.from.id]; let ch=ctx.match[1]; const doc=await db.collection('channels').doc(ch).get(); if(doc.exists)ch=doc.data().channelId; const topicId=ctx.match[2]; const td=await db.collection('topics').doc(topicId).get(); if(!td.exists)return ctx.answerCbQuery('❌ Video নেই'); const t=td.data(); const fileId=(t.videos&&t.videos[0])||t.videoId||''; if(!fileId)return ctx.answerCbQuery('❌ Video file পাওয়া যায়নি'); const kb=await buildConfiguredPostKeyboard(topicId); await ctx.answerCbQuery('Posting...'); try{const sent=await bot.telegram.sendVideo(ch,fileId,{caption:t.title||'',reply_markup:kb.reply_markup}); await recordTopicPost(topicId,ch,sent.message_id,'video',t.title||'',t.title||''); return ctx.reply(`✅ Post হয়েছে\n📢 ${ch}\n🆔 Message ID: ${sent.message_id}`, { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup });}catch(e){return ctx.reply('❌ Channel-এ post করা যায়নি: '+e.message);} });
@@ -3210,9 +3234,15 @@ bot.on('text', async (ctx) => {
   if (vipSubData[userId] && vipSubData[userId].step === 'userId') {
     const targetId = text.replace(/\D/g, '');
     if (!targetId) return ctx.reply('❌ সঠিক Telegram User ID দিন (শুধু সংখ্যা):');
-    vipSubData[userId] = { step: 'duration', targetId };
+    const mode = vipSubData[userId].mode || 'add';
+    if (mode === 'remove') {
+      delete vipSubData[userId];
+      return revokeVipSubscription(ctx, targetId);
+    }
+    vipSubData[userId] = { step: 'duration', targetId, mode };
+    const label = mode === 'set' ? 'এখন থেকে ঠিক কতদিন VIP থাকবে?' : 'কতদিনের জন্য Ad ছাড়া unlock করতে দেবেন? (বর্তমান মেয়াদের সাথে যোগ হবে)';
     return ctx.reply(
-      `👤 Target User: <code>${targetId}</code>\n\nকতদিনের জন্য Ad ছাড়া unlock করতে দেবেন?`,
+      `👤 Target User: <code>${targetId}</code>\n\n${label}`,
       { parse_mode: 'HTML', ...Markup.inlineKeyboard([
         [Markup.button.callback('7 দিন', 'vipdays:7'), Markup.button.callback('15 দিন', 'vipdays:15'), Markup.button.callback('30 দিন', 'vipdays:30')],
         [Markup.button.callback('✏️ Custom দিন', 'vipdays:custom')],
@@ -3222,10 +3252,10 @@ bot.on('text', async (ctx) => {
   }
   if (vipSubData[userId] && vipSubData[userId].step === 'customDays') {
     const days = Number.parseInt(text, 10);
-    if (!Number.isInteger(days) || days < 1) return ctx.reply('❌ ১ বা তার বেশি একটি সংখ্যা দিন:');
-    const targetId = vipSubData[userId].targetId;
+    if (!Number.isInteger(days) || days < 1) return ctx.reply('❌ ১ বা তার বেশি একটি সংখ্যা দিন (VIP বাদ দিতে চাইলে VIP মেনু থেকে "🗑️ VIP বাদ দিন" ব্যবহার করুন):');
+    const { targetId, mode } = vipSubData[userId];
     delete vipSubData[userId];
-    return grantVipSubscription(ctx, targetId, days);
+    return mode === 'set' ? setVipSubscription(ctx, targetId, days) : grantVipSubscription(ctx, targetId, days);
   }
 
   // Add Video/Topic text steps have priority over every other admin state.
@@ -4561,6 +4591,76 @@ async function grantVipSubscription(ctx, userId, days) {
   } catch (error) {
     console.error('❌ grantVipSubscription error:', error.message);
     return ctx.reply('❌ VIP Subscription সেট করতে সমস্যা হয়েছে: ' + error.message);
+  }
+}
+
+// Sets a VIP subscription's remaining time to EXACTLY `days` from now,
+// overriding whatever was there before — unlike grantVipSubscription this
+// can also be used to shorten an existing subscription (e.g. 30 days left,
+// admin sets it to 5).
+async function setVipSubscription(ctx, userId, days) {
+  try {
+    const userRef = db.collection('users').doc(String(userId));
+    const newExpiry = Date.now() + days * 24 * 60 * 60 * 1000;
+    await userRef.set({ subscriptionExpiresAt: newExpiry }, { merge: true });
+    armVipTimer(userId, newExpiry);
+    const dateStr = new Date(newExpiry).toLocaleString('bn-BD', { timeZone: 'Asia/Dhaka', dateStyle: 'medium', timeStyle: 'short' });
+    return ctx.reply(
+      `✅ VIP মেয়াদ বসানো হয়েছে!\n\n👤 User ID: <code>${userId}</code>\n📅 এখন থেকে: ${days} দিন\n⏰ মেয়াদ শেষ হবে: ${dateStr}`,
+      { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]) }
+    );
+  } catch (error) {
+    console.error('❌ setVipSubscription error:', error.message);
+    return ctx.reply('❌ VIP মেয়াদ বসাতে সমস্যা হয়েছে: ' + error.message);
+  }
+}
+
+// Immediately revokes a VIP subscription (user goes back to watching ads).
+async function revokeVipSubscription(ctx, userId) {
+  try {
+    const key = String(userId);
+    const existing = vipTimers.get(key);
+    if (existing) clearTimeout(existing);
+    vipTimers.delete(key);
+    const userRef = db.collection('users').doc(key);
+    const snap = await userRef.get();
+    if (!snap.exists || !Number(snap.data().subscriptionExpiresAt)) {
+      return ctx.reply(`ℹ️ User <code>${key}</code>-এর কোনো active VIP subscription নেই।`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]) });
+    }
+    await userRef.set({ subscriptionExpiresAt: admin.firestore.FieldValue.delete() }, { merge: true });
+    return ctx.reply(
+      `✅ VIP বাদ দেওয়া হয়েছে।\n\n👤 User ID: <code>${key}</code>\n\nএখন থেকে এই user আবার স্বাভাবিকভাবে Ad দেখে unlock করবে।`,
+      { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]) }
+    );
+  } catch (error) {
+    console.error('❌ revokeVipSubscription error:', error.message);
+    return ctx.reply('❌ VIP বাদ দিতে সমস্যা হয়েছে: ' + error.message);
+  }
+}
+
+// Lists every currently-active VIP subscription with remaining time — an
+// on-demand admin action, so the one query here (bounded by the existing
+// `subscriptionExpiresAt > 0` index used by recoverVipSubscriptions) is not
+// a recurring cost.
+async function listVipSubscriptions(ctx) {
+  try {
+    const now = Date.now();
+    const snap = await db.collection('users').where('subscriptionExpiresAt', '>', now).orderBy('subscriptionExpiresAt', 'asc').get();
+    if (snap.empty) {
+      return ctx.reply('📋 এই মুহূর্তে কোনো active VIP নেই।', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'adm_vip')]]));
+    }
+    const lines = snap.docs.map(doc => {
+      const d = doc.data();
+      const expiresAt = Number(d.subscriptionExpiresAt);
+      const daysLeft = Math.max(1, Math.ceil((expiresAt - now) / (24 * 60 * 60 * 1000)));
+      const name = d.username ? '@' + d.username : (d.firstName || '');
+      const dateStr = new Date(expiresAt).toLocaleString('bn-BD', { timeZone: 'Asia/Dhaka', dateStyle: 'medium' });
+      return `👤 <code>${doc.id}</code> ${name}\n   ⏳ বাকি: ${daysLeft} দিন (শেষ: ${dateStr})`;
+    });
+    return ctx.reply(`📋 VIP LIST (${snap.size} জন)\n\n${lines.join('\n\n')}`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'adm_vip')]]) });
+  } catch (error) {
+    console.error('❌ listVipSubscriptions error:', error.message);
+    return ctx.reply('❌ VIP list আনতে সমস্যা হয়েছে: ' + error.message);
   }
 }
 
