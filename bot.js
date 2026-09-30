@@ -957,6 +957,7 @@ bot.action('pch_continue', async ctx => {
       `📤 ${resolved.length}টি Channel সিলেক্ট হয়েছে।\n\nকী পোস্ট করবেন?`,
       Markup.inlineKeyboard([
         [Markup.button.callback('🎬 Video', 'post_type_video'), Markup.button.callback('🖼️ Photo', 'post_type_photo')],
+        [Markup.button.callback('📝 সাধারণ Post (Multi Photo/Video + Text)', 'post_type_general')],
         [Markup.button.callback('❌ Cancel', 'post_cancel')]
       ])
     );
@@ -1417,6 +1418,12 @@ bot.on('video', async (ctx) => {
     return;
   }
 
+  if (postData[userId] && postData[userId].step === 'general_media') {
+    postData[userId].media.push({ type: 'video', fileId });
+    await ctx.reply(`✅ যোগ হয়েছে (মোট ${postData[userId].media.length}টি)। আরও পাঠান, বা শেষ হলে /done লিখুন।`);
+    return;
+  }
+
 });
 
 bot.on('document', async (ctx) => {
@@ -1493,10 +1500,21 @@ bot.on('document', async (ctx) => {
     return;
   }
 
+  if (postData[userId] && postData[userId].step === 'general_media') {
+    postData[userId].media.push({ type: 'video', fileId });
+    await ctx.reply(`✅ যোগ হয়েছে (মোট ${postData[userId].media.length}টি)। আরও পাঠান, বা শেষ হলে /done লিখুন।`);
+    return;
+  }
+
 });
 
 bot.command('done', async (ctx) => {
   const userId = ctx.from.id;
+
+  if (postData[userId] && postData[userId].step === 'general_media') {
+    postData[userId].step = 'general_caption';
+    return ctx.reply('📝 এবার Caption/text লিখুন (না চাইলে "skip" লিখুন):');
+  }
 
   // /done also finalizes a Duplicate Topic workflow — title/thumbnail/ads
   // are already copied from the source topic, so no extra steps needed.
@@ -1599,6 +1617,7 @@ bot.command('post', async (ctx) => {
     Markup.inlineKeyboard([
       [Markup.button.callback('🎬 Video', 'post_type_video')],
       [Markup.button.callback('🖼️ Photo', 'post_type_photo')],
+      [Markup.button.callback('📝 সাধারণ Post (Multi Photo/Video + Text)', 'post_type_general')],
       [Markup.button.callback('❌ Cancel', 'post_cancel')]
     ])
   );
@@ -1622,6 +1641,136 @@ bot.action('post_type_photo', async (ctx) => {
   state.step = 'media';
   await ctx.answerCbQuery();
   await ctx.reply('🖼️ এখন Channel Post-এর জন্য Photo পাঠান।\n\n⚠️ এটি Storage Channel-এ যাবে না।');
+});
+
+// 📝 GENERAL POST — a plain channel post that is NOT tied to any Video/Topic
+// (announcements, promos, external links). Supports multiple photos/videos
+// (sent as an album) plus text, and either the shared "Post Buttons" set,
+// a one-off custom button, or no button at all.
+bot.action('post_type_general', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const state = postData[ctx.from.id];
+  if (!state || state.step !== 'mediaType') return ctx.answerCbQuery('❌ /post দিয়ে আবার শুরু করুন');
+  state.type = 'general';
+  state.step = 'general_media';
+  state.media = [];
+  await ctx.answerCbQuery();
+  await ctx.reply('📝 Photo/Video পাঠান (একাধিক পাঠাতে পারবেন, একে একে)।\n\n⚠️ এগুলো Storage Channel-এ যাবে না, সরাসরি সিলেক্ট করা channel-এ যাবে।\n\nমিডিয়া ছাড়া শুধু text post করতে চাইলে সরাসরি /done লিখুন।\n\nসব পাঠানো শেষ হলে /done লিখুন।');
+});
+
+bot.action('gp_btn_configured', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const state = postData[ctx.from.id];
+  if (!state || state.step !== 'general_button') return ctx.answerCbQuery('❌ Session হারিয়ে গেছে, /post দিয়ে আবার শুরু করুন');
+  await ctx.answerCbQuery();
+  const helpLink = await getHelpAdminLink();
+  const configured = await getPostButtons();
+  const rows = [];
+  for (const b of configured) {
+    const name = String(b.name || '').trim().slice(0, 60);
+    if (!name) continue;
+    let url = String(b.url || '').trim();
+    // No Video/Topic here, so a {VIDEO_LINK} button can't be resolved — skip it.
+    if (url === '{VIDEO_LINK}') continue;
+    if (url === '{HELP_LINK}') url = helpLink || '';
+    if (/^https?:\/\//i.test(url)) rows.push([Markup.button.url(name, url)]);
+  }
+  if (!rows.length) {
+    return ctx.reply('ℹ️ ব্যবহারযোগ্য কোনো configured button নেই ({VIDEO_LINK} button এখানে কাজ করে না)। "✏️ Custom Button" অথবা "🚫 কোনো বাটন না" বেছে নিন।');
+  }
+  state.buttonRows = rows;
+  state.step = 'general_confirm';
+  return sendGeneralPostPreview(ctx, state);
+});
+
+bot.action('gp_btn_custom', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const state = postData[ctx.from.id];
+  if (!state || state.step !== 'general_button') return ctx.answerCbQuery('❌ Session হারিয়ে গেছে, /post দিয়ে আবার শুরু করুন');
+  await ctx.answerCbQuery();
+  state.step = 'general_custom_name';
+  return ctx.reply('✏️ Button-এর লেখা দিন (যেমন: Join Channel):');
+});
+
+bot.action('gp_btn_none', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const state = postData[ctx.from.id];
+  if (!state || state.step !== 'general_button') return ctx.answerCbQuery('❌ Session হারিয়ে গেছে, /post দিয়ে আবার শুরু করুন');
+  await ctx.answerCbQuery();
+  state.buttonRows = [];
+  state.step = 'general_confirm';
+  return sendGeneralPostPreview(ctx, state);
+});
+
+function sendGeneralPostPreview(ctx, state) {
+  const channelCount = (state.channels && state.channels.length) || 0;
+  const mediaCount = state.media.length;
+  const captionPreview = state.caption ? escapeHtml(state.caption.slice(0, 200)) : '(কোনো caption নেই)';
+  const btnLabel = state.buttonRows.length ? `${state.buttonRows.length}টি বাটন` : 'কোনো বাটন নেই';
+  return ctx.reply(
+    `👀 PREVIEW\n\n📢 Channel: ${channelCount}টি\n🖼️ Media: ${mediaCount}টি\n🔘 Button: ${btnLabel}\n\n📝 Caption:\n${captionPreview}`,
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Publish করুন', 'gp_confirm')],
+      [Markup.button.callback('❌ Cancel', 'post_cancel')]
+    ]) }
+  );
+}
+
+bot.action('gp_confirm', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const userId = ctx.from.id;
+  const state = postData[userId];
+  if (!state || state.step !== 'general_confirm') return ctx.answerCbQuery('❌ Post data পাওয়া যায়নি। /post দিয়ে আবার শুরু করুন');
+  const postingChannels = (state.channels && state.channels.length) ? state.channels : (POST_CHANNEL ? [POST_CHANNEL] : []);
+  if (!postingChannels.length) return ctx.answerCbQuery('❌ Posting Channel সেট করা নেই');
+  await ctx.answerCbQuery('Posting...');
+
+  const keyboard = state.buttonRows.length ? Markup.inlineKeyboard(state.buttonRows) : null;
+  const lines = [];
+
+  for (const channel of postingChannels) {
+    try {
+      if (state.media.length === 0) {
+        // Text-only post.
+        const sent = await bot.telegram.sendMessage(channel, state.caption || '\u200B', keyboard ? { reply_markup: keyboard.reply_markup } : {});
+        lines.push(`✅ ${channel} — Message ID: ${sent.message_id}`);
+      } else if (state.media.length === 1) {
+        // Single item CAN carry the button directly.
+        const m = state.media[0];
+        const opts = { caption: state.caption || undefined, reply_markup: keyboard ? keyboard.reply_markup : undefined };
+        const sent = m.type === 'video'
+          ? await bot.telegram.sendVideo(channel, m.fileId, opts)
+          : await bot.telegram.sendPhoto(channel, m.fileId, opts);
+        lines.push(`✅ ${channel} — Message ID: ${sent.message_id}`);
+      } else {
+        // Telegram albums (sendMediaGroup) cannot carry an inline keyboard.
+        // Send the album (caption on the first item), then — if a button
+        // was requested — a short follow-up message carrying just that
+        // button, right under the album.
+        const group = state.media.map((m, i) => ({
+          type: m.type,
+          media: m.fileId,
+          ...(i === 0 && state.caption ? { caption: state.caption } : {})
+        }));
+        const sentGroup = await bot.telegram.sendMediaGroup(channel, group);
+        let lastId = sentGroup[sentGroup.length - 1].message_id;
+        if (keyboard) {
+          const sentBtn = await bot.telegram.sendMessage(channel, '👇', { reply_markup: keyboard.reply_markup });
+          lastId = sentBtn.message_id;
+        }
+        lines.push(`✅ ${channel} — Message ID: ${lastId}`);
+      }
+    } catch (chErr) {
+      console.error(`❌ General post publish error [${channel}]:`, chErr.message);
+      lines.push(`❌ ${channel} — ${chErr.message}`);
+    }
+  }
+
+  delete postData[userId];
+  return ctx.reply(
+    `📤 সাধারণ Post সম্পন্ন হয়েছে (${postingChannels.length}টি Channel):\n\n` + escapeHtml(lines.join('\n')),
+    { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup }
+  );
 });
 
 bot.action('post_cancel', async (ctx) => {
@@ -3209,6 +3358,28 @@ bot.on('text', async (ctx) => {
 
   if (await handleForwardedRepostCapture(ctx)) return;
 
+  if (postData[userId] && postData[userId].step === 'general_caption') {
+    postData[userId].caption = text.toLowerCase() === 'skip' ? '' : text;
+    postData[userId].step = 'general_button';
+    return ctx.reply('🔘 কোন বাটন লাগবে?', Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Post Button ব্যবহার করুন', 'gp_btn_configured')],
+      [Markup.button.callback('✏️ Custom Button', 'gp_btn_custom')],
+      [Markup.button.callback('🚫 কোনো বাটন না', 'gp_btn_none')]
+    ]));
+  }
+  if (postData[userId] && postData[userId].step === 'general_custom_name') {
+    postData[userId].customButtonName = text.slice(0, 60);
+    postData[userId].step = 'general_custom_url';
+    return ctx.reply('🔗 এখন Button-এর জন্য একটি https:// link দিন:');
+  }
+  if (postData[userId] && postData[userId].step === 'general_custom_url') {
+    if (!/^https?:\/\//i.test(text)) return ctx.reply('❌ সঠিক https:// link দিন:');
+    const state = postData[userId];
+    state.buttonRows = [[Markup.button.url(state.customButtonName, text)]];
+    state.step = 'general_confirm';
+    return sendGeneralPostPreview(ctx, state);
+  }
+
   if (forwardRepostData[userId] && forwardRepostData[userId].step === 'topicId') {
     const pending = forwardRepostData[userId];
     delete forwardRepostData[userId];
@@ -3731,6 +3902,12 @@ bot.on('photo', async (ctx) => {
     postData[userId].fileId = fileId;
     postData[userId].step = 'topicId';
     await ctx.reply('🔢 এই Photo কোন Video/Topic-এর জন্য?\n\n👉 Video/Topic ID পাঠান:');
+    return;
+  }
+
+  if (postData[userId] && postData[userId].step === 'general_media') {
+    postData[userId].media.push({ type: 'photo', fileId });
+    await ctx.reply(`✅ যোগ হয়েছে (মোট ${postData[userId].media.length}টি)। আরও পাঠান, বা শেষ হলে /done লিখুন।`);
     return;
   }
 
