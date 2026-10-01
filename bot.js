@@ -328,19 +328,18 @@ async function rebuildTopicsIndex() {
     id: t.id,
     title: t.title || '',
     thumbnail: t.thumbnail || '',
-    thumbnails: Array.isArray(t.thumbnails) ? t.thumbnails.slice(0, 5) : undefined,
+    // 🐛 FIX (future-proofing against the 1 MB Firestore document limit):
+    // the webapp card UI only ever reads `thumbnail` (singular) — grep
+    // confirms `thumbnails` (plural, up to 5 full URLs per topic) is never
+    // read anywhere in index.html or worker.js. It was dead weight in every
+    // card, and the single biggest thing that would push this document back
+    // toward the size limit as more topics get added. Dropped entirely; no
+    // functional change, since nothing used it.
     adsRequired: Number(t.adsRequired) || 0,
     sortOrder: t.sortOrder,
     createdAt: t.createdAt || null,
     videoCount: Number(t.videoCount) || (Array.isArray(t.videos) ? t.videos.length : 0),
-    // 🐛 FIX: Trending/Popular/New all looked identical in the Mini App.
-    // unlockCount increments correctly on Firestore (see worker.js's
-    // recordUnlock) but was missing from this allow-list, so the card the
-    // webapp actually receives always had views=0 — Popular (sorts by
-    // views) and Trending (sorts by recency+views) had nothing to tell
-    // topics apart with. Adding the one field already being tracked; no new
-    // read, no new write, no change to the index-rebuild cadence.
-    unlockCount: Number(t.unlockCount) || 0
+    unlockCount: Number(t.unlockCount) || 0 // 🐛 FIX: views missing → Trending/Popular looked the same
   }));
   await db.collection('system').doc('topicsIndex').set({ cards, updatedAt: Date.now() });
   console.log(`🗂️ topicsIndex rebuilt (${cards.length} topics)`);
