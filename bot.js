@@ -315,19 +315,33 @@ function scheduleTopicsIndexRebuild() {
 }
 async function rebuildTopicsIndex() {
   const topics = await getTopicsCached();
-  const cards = topics.map(t => {
-    const { videos, recentUnlocks, lastUnlockAt, dailyUnlockDate, dailyUnlockCount, ...rest } = t;
-    return JSON.parse(JSON.stringify({
-      ...rest,
-      videoCount: Number(t.videoCount) || (Array.isArray(videos) ? videos.length : 0)
-    }));
-  });
+  // 🐛 FIX: this used to spread `...rest`, which kept `postRecords` on every
+  // card — a history array (up to 50 entries, each with its own caption,
+  // title, channelId etc) that the webapp card list never needed. Across
+  // 234 topics that bloated this ONE document enough that Firebase Console
+  // showed "cards: Array of ~4200 — too large to display" (a size-based
+  // estimate, since the true array length is 234) and the Cloudflare Worker
+  // could time out decoding it, which is why /api/topics started silently
+  // returning an empty list. Build each card from an explicit allow-list
+  // instead — only what the webapp card UI actually reads.
+  const cards = topics.map(t => ({
+    id: t.id,
+    title: t.title || '',
+    thumbnail: t.thumbnail || '',
+    thumbnails: Array.isArray(t.thumbnails) ? t.thumbnails.slice(0, 5) : undefined,
+    adsRequired: Number(t.adsRequired) || 0,
+    sortOrder: t.sortOrder,
+    createdAt: t.createdAt || null,
+    videoCount: Number(t.videoCount) || (Array.isArray(t.videos) ? t.videos.length : 0)
+  }));
   await db.collection('system').doc('topicsIndex').set({ cards, updatedAt: Date.now() });
   console.log(`🗂️ topicsIndex rebuilt (${cards.length} topics)`);
 }
+// Always rebuilds on startup (not just "if missing") so a bad/bloated
+// index — like the one this fix cleans up — self-heals on the next deploy
+// without needing a manual trigger.
 async function ensureTopicsIndex() {
-  const doc = await db.collection('system').doc('topicsIndex').get();
-  if (!doc.exists) await rebuildTopicsIndex();
+  await rebuildTopicsIndex();
 }
 
 async function getSingleTopicCached(topicId) {
