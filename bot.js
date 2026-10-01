@@ -332,7 +332,15 @@ async function rebuildTopicsIndex() {
     adsRequired: Number(t.adsRequired) || 0,
     sortOrder: t.sortOrder,
     createdAt: t.createdAt || null,
-    videoCount: Number(t.videoCount) || (Array.isArray(t.videos) ? t.videos.length : 0)
+    videoCount: Number(t.videoCount) || (Array.isArray(t.videos) ? t.videos.length : 0),
+    // 🐛 FIX: Trending/Popular/New all looked identical in the Mini App.
+    // unlockCount increments correctly on Firestore (see worker.js's
+    // recordUnlock) but was missing from this allow-list, so the card the
+    // webapp actually receives always had views=0 — Popular (sorts by
+    // views) and Trending (sorts by recency+views) had nothing to tell
+    // topics apart with. Adding the one field already being tracked; no new
+    // read, no new write, no change to the index-rebuild cadence.
+    unlockCount: Number(t.unlockCount) || 0
   }));
   await db.collection('system').doc('topicsIndex').set({ cards, updatedAt: Date.now() });
   console.log(`🗂️ topicsIndex rebuilt (${cards.length} topics)`);
