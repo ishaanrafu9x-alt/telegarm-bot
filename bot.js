@@ -1723,7 +1723,8 @@ bot.action('gp_btn_none', async (ctx) => {
   return sendGeneralPostPreview(ctx, state);
 });
 
-function sendGeneralPostPreview(ctx, state) {
+async function sendGeneralPostPreview(ctx, state) {
+  if (state.caption) await ctx.reply(state.caption, textEntitiesExtra(state.captionEntities)); // formatted preview of the caption
   const channelCount = (state.channels && state.channels.length) || 0;
   const mediaCount = state.media.length;
   const captionPreview = state.caption ? escapeHtml(state.caption.slice(0, 200)) : '(কোনো caption নেই)';
@@ -1753,12 +1754,12 @@ bot.action('gp_confirm', async (ctx) => {
     try {
       if (state.media.length === 0) {
         // Text-only post.
-        const sent = await bot.telegram.sendMessage(channel, state.caption || '\u200B', keyboard ? { reply_markup: keyboard.reply_markup } : {});
+        const sent = await bot.telegram.sendMessage(channel, state.caption || '\u200B', { ...(state.caption ? textEntitiesExtra(state.captionEntities) : {}), ...(keyboard ? { reply_markup: keyboard.reply_markup } : {}) });
         lines.push(`✅ ${channel} — Message ID: ${sent.message_id}`);
       } else if (state.media.length === 1) {
         // Single item CAN carry the button directly.
         const m = state.media[0];
-        const opts = { caption: state.caption || undefined, reply_markup: keyboard ? keyboard.reply_markup : undefined };
+        const opts = { ...captionExtra(state.caption, state.captionEntities), reply_markup: keyboard ? keyboard.reply_markup : undefined };
         const sent = m.type === 'video'
           ? await bot.telegram.sendVideo(channel, m.fileId, opts)
           : await bot.telegram.sendPhoto(channel, m.fileId, opts);
@@ -1771,7 +1772,7 @@ bot.action('gp_confirm', async (ctx) => {
         const group = state.media.map((m, i) => ({
           type: m.type,
           media: m.fileId,
-          ...(i === 0 && state.caption ? { caption: state.caption } : {})
+          ...(i === 0 && state.caption ? captionExtra(state.caption, state.captionEntities) : {})
         }));
         const sentGroup = await bot.telegram.sendMediaGroup(channel, group);
         let lastId = sentGroup[sentGroup.length - 1].message_id;
@@ -1986,6 +1987,7 @@ bot.action(/^sched_repeat:(none|daily|weekly)$/, async (ctx) => {
       type: state.type,
       fileId: state.fileId,
       caption: state.caption || '',
+      captionEntities: cleanBroadcastEntities(state.captionEntities),
       topicId: state.topicId,
       // 🐛 FIX: the topic's title used to be shown wherever this schedule
       // shows up later (the Scheduled Posts list, the "sent" notification),
@@ -2057,12 +2059,12 @@ bot.action('post_confirm', async (ctx) => {
         let sent;
         if (state.type === 'video') {
           sent = await bot.telegram.sendVideo(postingChannel, state.fileId, {
-            caption: state.caption || undefined,
+            ...captionExtra(state.caption, state.captionEntities),
             reply_markup: keyboard.reply_markup
           });
         } else {
           sent = await bot.telegram.sendPhoto(postingChannel, state.fileId, {
-            caption: state.caption || undefined,
+            ...captionExtra(state.caption, state.captionEntities),
             reply_markup: keyboard.reply_markup
           });
         }
@@ -3265,18 +3267,72 @@ bot.command('broadcast', async (ctx) => {
   }
 });
 
+// Telegram "premium/custom emoji" entities can't be sent by normal bots and
+// would make the whole message fail — drop only those (the normal emoji
+// character stays in the text). Everything else is kept as typed.
+function cleanBroadcastEntities(entities) {
+  return (entities || []).filter(e => e && e.type !== 'custom_emoji');
+}
+
+// Formatting helpers shared by channel posts / scheduled posts.
+// caption + Telegram entities (bold/italic/links/spoiler/quote/...) so the
+// channel post looks exactly like what the admin typed.
+function captionExtra(caption, entities) {
+  if (!caption) return {};
+  const ents = cleanBroadcastEntities(entities);
+  return { caption, ...(ents.length ? { caption_entities: ents } : {}) };
+}
+function textEntitiesExtra(entities) {
+  const ents = cleanBroadcastEntities(entities);
+  return ents.length ? { entities: ents } : {};
+}
+
+// Sends ONE broadcast item (text/photo/video/GIF/poll) keeping the admin's
+// formatting. Used by BOTH the preview and the real broadcast, so what the
+// admin sees in the preview is exactly what users get.
+async function sendBroadcastContent(chatId, data, extra = {}) {
+  if (data.type === 'poll') {
+    return safeSendPoll(chatId, data.question, data.options, {
+      is_anonymous: true, allows_multiple_answers: false, ...extra
+    });
+  }
+  const msg = data.message || '';
+  const ents = cleanBroadcastEntities(data.entities);
+  const textExtra = { ...extra, ...(ents.length ? { entities: ents } : {}) };
+
+  const mediaSender = { photo: safeSendPhoto, video: safeSendVideo, animation: safeSendAnimation }[data.type];
+  if (mediaSender) {
+    if (msg.length <= 1024) {
+      // normal case: formatted caption under the media
+      return mediaSender(chatId, data.file, {
+        ...extra, caption: msg, ...(ents.length ? { caption_entities: ents } : {})
+      });
+    }
+    // Telegram caps captions at 1024 chars -> send media, then the full
+    // formatted text as a separate message (instead of failing for everyone).
+    const first = await mediaSender(chatId, data.file, {});
+    if (!first) return null;
+    await safeSendMessage(chatId, msg, textExtra);
+    return first;
+  }
+  return safeSendMessage(chatId, msg, textExtra);
+}
+
 async function showBroadcastPreview(ctx, data) {
   const typeLabel = { photo: '🖼️ Photo', video: '🎬 Video', animation: '🎞️ GIF', poll: '📊 Poll', text: '✏️ Text' }[data.type] || data.type;
-  let preview = `⚠️ ব্রডকাস্ট Preview — সব verified ইউজারকে যাবে!\n\n📦 Type: ${typeLabel}\n`;
-  if (data.type === 'poll') {
-    preview += `❓ প্রশ্ন: ${data.question}\n🔘 অপশন: ${data.options.join(' | ')}`;
-  } else {
-    preview += `📝 Message:\n${String(data.message || '(কোনো মেসেজ নেই)').slice(0, 500)}`;
-  }
-  preview += `\n\nএটা সব ইউজারকে পাঠাতে "✅ Confirm" চাপুন, নাহলে "❌ Cancel" চাপুন।`;
-  return ctx.reply(preview, Markup.inlineKeyboard([
+  const kb = Markup.inlineKeyboard([
     [Markup.button.callback('✅ Confirm & Send', 'bcast_confirm'), Markup.button.callback('❌ Cancel', 'bcast_cancel')]
-  ]));
+  ]);
+  const header = `⚠️ ব্রডকাস্ট Preview — সব verified ইউজারকে যাবে!\n📦 Type: ${({ photo: '🖼️ Photo', video: '🎬 Video', animation: '🎞️ GIF', poll: '📊 Poll', text: '✏️ Text' })[data.type] || data.type}\n\n👇 নিচের মেসেজটা ঠিক এভাবেই (এই ফরম্যাটেই) সবাই পাবে। ঠিক থাকলে "✅ Confirm" চাপুন, নাহলে "❌ Cancel"।`;
+  await ctx.reply(header);
+  try {
+    // the real content, with the Confirm/Cancel buttons attached to it
+    return await sendBroadcastContent(ctx.chat.id, data, { reply_markup: kb.reply_markup });
+  } catch (error) {
+    console.error('❌ Broadcast preview error:', error);
+    await ctx.reply('❌ Preview দেখাতে সমস্যা: ' + error.message + '\n\nঠিক করে আবার /broadcast দিন।');
+    delete broadcastData[ctx.from.id];
+  }
 }
 
 bot.action('bcast_confirm', async (ctx) => {
@@ -3309,25 +3365,8 @@ async function runBroadcast(ctx, data) {
     let success = 0, failed = 0, blocked = 0;
     for (const user of users) {
       try {
-        if (data.type === 'photo') {
-          const res = await safeSendPhoto(user.userId, data.file, { caption: data.message || '' });
-          if (res) success++; else blocked++;
-        } else if (data.type === 'video') {
-          const res = await safeSendVideo(user.userId, data.file, { caption: data.message || '' });
-          if (res) success++; else blocked++;
-        } else if (data.type === 'animation') {
-          const res = await safeSendAnimation(user.userId, data.file, { caption: data.message || '' });
-          if (res) success++; else blocked++;
-        } else if (data.type === 'poll') {
-          const res = await safeSendPoll(user.userId, data.question, data.options, {
-            is_anonymous: true,
-            allows_multiple_answers: false
-          });
-          if (res) success++; else blocked++;
-        } else {
-          const res = await safeSendMessage(user.userId, data.message);
-          if (res) success++; else blocked++;
-        }
+        const res = await sendBroadcastContent(user.userId, data);
+        if (res) success++; else blocked++;
       } catch (error) {
         failed++;
         console.error(`❌ Failed to send to ${user.userId}:`, error.message);
@@ -3380,7 +3419,9 @@ bot.on('text', async (ctx) => {
   if (await handleForwardedRepostCapture(ctx)) return;
 
   if (postData[userId] && postData[userId].step === 'general_caption') {
-    postData[userId].caption = text.toLowerCase() === 'skip' ? '' : text;
+    const gSkip = text.toLowerCase() === 'skip';
+    postData[userId].caption = gSkip ? '' : ctx.message.text;
+    postData[userId].captionEntities = gSkip ? [] : (ctx.message.entities || []);
     postData[userId].step = 'general_button';
     return ctx.reply('🔘 কোন বাটন লাগবে?', Markup.inlineKeyboard([
       [Markup.button.callback('✅ Post Button ব্যবহার করুন', 'gp_btn_configured')],
@@ -3568,8 +3609,11 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.step === 'caption') {
-      state.caption = text.toLowerCase() === 'skip' ? '' : text;
+      const tSkip = text.toLowerCase() === 'skip';
+      state.caption = tSkip ? '' : ctx.message.text;
+      state.captionEntities = tSkip ? [] : (ctx.message.entities || []);
       state.step = 'confirm';
+      if (state.caption) await ctx.reply(state.caption, textEntitiesExtra(state.captionEntities)); // formatted preview of the caption
 
       return ctx.reply(
         `👀 Post Preview\n\n` +
@@ -3851,7 +3895,12 @@ bot.on('text', async (ctx) => {
     }
 
     if (data.step === 'message') {
-      data.message = text;
+      // Keep the EXACT text + Telegram formatting entities (bold, italic, links,
+      // spoiler, quote, code, emoji...) so the broadcast looks identical to what
+      // the admin typed. Raw (untrimmed) text is used because entity offsets
+      // are relative to the raw text.
+      data.message = ctx.message.text;
+      data.entities = ctx.message.entities || [];
       data.step = 'confirm';
       await showBroadcastPreview(ctx, data);
       return;
@@ -4946,9 +4995,9 @@ async function firePostSchedule(docId) {
       try {
         let sent;
         if (sp.type === 'video') {
-          sent = await bot.telegram.sendVideo(channelId, sp.fileId, { caption: sp.caption || undefined, reply_markup: keyboard.reply_markup });
+          sent = await bot.telegram.sendVideo(channelId, sp.fileId, { ...captionExtra(sp.caption, sp.captionEntities), reply_markup: keyboard.reply_markup });
         } else {
-          sent = await bot.telegram.sendPhoto(channelId, sp.fileId, { caption: sp.caption || undefined, reply_markup: keyboard.reply_markup });
+          sent = await bot.telegram.sendPhoto(channelId, sp.fileId, { ...captionExtra(sp.caption, sp.captionEntities), reply_markup: keyboard.reply_markup });
         }
         await recordTopicPost(sp.topicId, channelId, sent.message_id, sp.type, sp.caption || '', sp.topicId);
         lines.push(`✅ ${channelId} — Message ID: ${sent.message_id}`);
