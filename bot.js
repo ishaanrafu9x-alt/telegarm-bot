@@ -1082,6 +1082,7 @@ async function getOrCreateUser(userId, username, firstName, lastName) {
         lastName: lastName || '',
         verified: false,
         verifiedAt: null,
+        broadcastBlocked: false,
         createdAt: new Date().toISOString(),
         unlockedTopics: [],
         topicUnlockTime: {},
@@ -1101,7 +1102,13 @@ async function getOrCreateUser(userId, username, firstName, lastName) {
       }, { merge: true }).catch(e => console.error('❌ dailyStats increment error:', e.message));
       return { userId, username, firstName, lastName, verified: false, unlockedTopics: [], topicUnlockTime: {}, sentMessages: [], cleanupDueAt: null };
     }
-    return { id: doc.id, ...doc.data() };
+    const existing = doc.data();
+    if (existing.broadcastBlocked === true) {
+      // user is talking to the bot again -> they unblocked it
+      userRef.update({ broadcastBlocked: false }).catch(() => {});
+      existing.broadcastBlocked = false;
+    }
+    return { id: doc.id, ...existing };
   } catch (error) {
     console.error('Error in getOrCreateUser:', error);
     return { userId, verified: false };
@@ -3323,7 +3330,7 @@ async function showBroadcastPreview(ctx, data) {
   const kb = Markup.inlineKeyboard([
     [Markup.button.callback('✅ Confirm & Send', 'bcast_confirm'), Markup.button.callback('❌ Cancel', 'bcast_cancel')]
   ]);
-  const header = `⚠️ ব্রডকাস্ট Preview — সব verified ইউজারকে যাবে!\n📦 Type: ${({ photo: '🖼️ Photo', video: '🎬 Video', animation: '🎞️ GIF', poll: '📊 Poll', text: '✏️ Text' })[data.type] || data.type}\n\n👇 নিচের মেসেজটা ঠিক এভাবেই (এই ফরম্যাটেই) সবাই পাবে। ঠিক থাকলে "✅ Confirm" চাপুন, নাহলে "❌ Cancel"।`;
+  const header = `⚠️ ব্রডকাস্ট Preview — সব ইউজারকে যাবে (যারা bot block করেনি)!\n📦 Type: ${({ photo: '🖼️ Photo', video: '🎬 Video', animation: '🎞️ GIF', poll: '📊 Poll', text: '✏️ Text' })[data.type] || data.type}\n\n👇 নিচের মেসেজটা ঠিক এভাবেই (এই ফরম্যাটেই) সবাই পাবে। ঠিক থাকলে "✅ Confirm" চাপুন, নাহলে "❌ Cancel"।`;
   await ctx.reply(header);
   try {
     // the real content, with the Confirm/Cancel buttons attached to it
@@ -3352,29 +3359,71 @@ bot.action('bcast_cancel', async (ctx) => {
   return ctx.editMessageText('❌ Broadcast বাতিল করা হয়েছে।');
 });
 
+// 📣 Broadcast goes to EVERY user who has not blocked the bot (verified or not).
+// 💸 Read-saving design: users who blocked the bot are flagged
+// `broadcastBlocked: true`, and the query only fetches `broadcastBlocked == false`,
+// so blocked users cost 0 reads from the 2nd broadcast onward.
+// The very first broadcast does a one-time backfill (adds broadcastBlocked:false
+// to old user docs that don't have the field yet) and records it in
+// system/broadcastMeta so it never repeats.
 async function runBroadcast(ctx, data) {
   try {
     await ctx.reply('⏳ ব্রডকাস্ট শুরু হচ্ছে...');
-    const snapshot = await db.collection('users').where('verified', '==', true).get();
-    const users = snapshot.docs.map(doc => doc.data());
 
-    if (users.length === 0) {
-      return ctx.reply('📭 কোনো যাচাইকৃত ইউজার নেই।');
+    const metaRef = db.collection('system').doc('broadcastMeta');
+    const metaDoc = await metaRef.get();
+    const migrated = metaDoc.exists && metaDoc.data().migrated === true;
+
+    let docs;
+    if (!migrated) {
+      const snapshot = await db.collection('users').select('userId', 'broadcastBlocked').get();
+      docs = snapshot.docs;
+      // one-time backfill so future queries can filter on broadcastBlocked == false
+      const missing = docs.filter(d => d.data().broadcastBlocked === undefined);
+      for (let i = 0; i < missing.length; i += 400) {
+        const batch = db.batch();
+        missing.slice(i, i + 400).forEach(d => batch.update(d.ref, { broadcastBlocked: false }));
+        await batch.commit();
+      }
+      await metaRef.set({ migrated: true, migratedAt: new Date().toISOString() }, { merge: true });
+    } else {
+      const snapshot = await db.collection('users').where('broadcastBlocked', '==', false).select('userId').get();
+      docs = snapshot.docs;
+    }
+
+    const targets = docs.filter(d => d.data().broadcastBlocked !== true);
+    if (targets.length === 0) {
+      return ctx.reply('📭 ব্রডকাস্ট করার মতো কোনো ইউজার নেই।');
     }
 
     let success = 0, failed = 0, blocked = 0;
-    for (const user of users) {
+    const blockedRefs = [];
+    for (const d of targets) {
+      const uid = d.data().userId || d.id;
       try {
-        const res = await sendBroadcastContent(user.userId, data);
-        if (res) success++; else blocked++;
+        const res = await sendBroadcastContent(uid, data);
+        if (res) success++;
+        else { blocked++; blockedRefs.push(d.ref); }
       } catch (error) {
         failed++;
-        console.error(`❌ Failed to send to ${user.userId}:`, error.message);
+        console.error(`❌ Failed to send to ${uid}:`, error.message);
       }
       await new Promise(resolve => setTimeout(resolve, 40));
     }
 
-    await ctx.reply(`✅ ব্রডকাস্ট শেষ!\n✅ সফল: ${success}\n🚫 Blocked/সরানো: ${blocked}\n❌ ব্যর্থ: ${failed}`);
+    // flag blocked users so the next broadcast skips them (saves reads + sends)
+    for (let i = 0; i < blockedRefs.length; i += 400) {
+      try {
+        const batch = db.batch();
+        blockedRefs.slice(i, i + 400).forEach(ref =>
+          batch.update(ref, { broadcastBlocked: true, broadcastBlockedAt: new Date().toISOString() }));
+        await batch.commit();
+      } catch (e) {
+        console.error('❌ Failed to flag blocked users:', e.message);
+      }
+    }
+
+    await ctx.reply(`✅ ব্রডকাস্ট শেষ!\n👥 মোট: ${targets.length}\n✅ সফল: ${success}\n🚫 Blocked/সরানো: ${blocked}\n❌ ব্যর্থ: ${failed}`);
   } catch (error) {
     console.error('❌ Error in broadcast run:', error);
     await ctx.reply('❌ ব্রডকাস্ট করতে সমস্যা: ' + error.message);
@@ -4618,6 +4667,7 @@ app.post('/api/ad-complete', async (req, res) => {
           userId,
           verified: false,
           verifiedAt: null,
+          broadcastBlocked: false,
           createdAt: new Date().toISOString(),
           unlockedTopics: [],
           topicUnlockTime: {},
