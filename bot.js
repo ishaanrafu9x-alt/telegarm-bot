@@ -789,14 +789,6 @@ async function handleForwardedRepostCapture(ctx) {
     return true;
   }
 
-  // A copy made by the Repost button is not a source post — adding it would
-  // put a duplicate of the original into the list.
-  const hiddenIds = await getRepostHiddenIds(info.channelId);
-  if (hiddenIds.has(Number(info.messageId))) {
-    await ctx.reply('ℹ️ এটা Repost করা কপি (বা মুছে যাওয়া Post)। এটা list-এ যোগ করা যাবে না — original Post-টা Forward করুন।');
-    return true;
-  }
-
   const channels = await getChannels();
   const known = channels.find(c => String(c.channelId) === info.channelId);
   if (!known) {
@@ -994,10 +986,11 @@ bot.action('pch_continue', async ctx => {
     if (!fileId) return ctx.reply('❌ Video file পাওয়া যায়নি।');
     const kb = await buildConfiguredPostKeyboard(topicId);
     const lines = [];
+    const saveEntries = [];
     for (const channelId of resolved) {
       try {
         const sent = await bot.telegram.sendVideo(channelId, fileId, { caption: t.title || '', reply_markup: kb.reply_markup });
-        await recordTopicPost(topicId, channelId, sent.message_id, 'video', t.title || '', t.title || '');
+        saveEntries.push({ channelId, messageId: sent.message_id, type: 'video', caption: t.title || '', title: t.title || '', topicId });
         lines.push(`✅ ${channelId} — Message ID: ${sent.message_id}`);
       } catch (e) {
         lines.push(`❌ ${channelId} — ${e.message}`);
@@ -1005,7 +998,7 @@ bot.action('pch_continue', async ctx => {
     }
     return ctx.reply(
       `📤 Post সম্পন্ন হয়েছে (${resolved.length}টি Channel):\n\n${lines.join('\n')}`,
-      { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup }
+      { reply_markup: postDoneMarkup(saveEntries) }
     );
   }
 });
@@ -1809,174 +1802,184 @@ bot.action('post_cancel', async (ctx) => {
   await ctx.reply('❌ Post বাতিল করা হয়েছে।');
 });
 
-async function recordTopicPost(topicId, channelId, messageId, type, caption = '', title = '') {
-  if (!topicId || !channelId || !messageId) return;
-  try {
-    const record = {
-      channelId: String(channelId),
-      messageId: Number(messageId),
-      type: type || 'video',
-      caption: String(caption || ''),
-      title: String(title || ''),
-      postedAt: Date.now()
-    };
+// =============================================
+// 📢 REPOST LIST — MANUAL SAVE ONLY
+// =============================================
+// Posts are NO LONGER saved automatically. After you publish a post the bot
+// shows a "💾 Save" button; only what you tap Save on (or add via
+// "Forward করে যোগ করুন") lands in the Repost list.
+//
+// Firestore cost design:
+//   • ONE document per channel: repostLists/{channelId} = { items: [...] }
+//   • opening a list  = 1 read the first time, then 0 (server memory cache)
+//   • Save / Delete   = 1 write (batched, no matter how many items)
+//   • Search / paging = 0 reads, 0 writes (done on the cached list)
+//   • Posting itself no longer touches Firestore for the list, and no longer
+//     invalidates the topics cache / rebuilds topicsIndex (that used to cost
+//     ~200+ reads on every single post).
+const REPOST_LIST_MAX = 2000;                 // per channel (~500 KB, safely under the 1 MB doc limit)
+const REPOST_CACHE_TTL = 6 * 60 * 60 * 1000;  // only this server writes, so a long TTL is safe
+const repostListCache = new Map();            // channelId -> { items, at }
+const repostLocks = new Map();                // channelId -> promise tail (serialises writes)
 
-    // Keep the old topic-level history for compatibility.
-    const ref = db.collection('topics').doc(String(topicId));
-    const snap = await ref.get();
-    if (snap.exists) {
-      const data = snap.data() || {};
-      const records = Array.isArray(data.postRecords) ? data.postRecords : [];
-      records.push(record);
-      await ref.update({ postRecords: records.slice(-50), updatedAt: new Date().toISOString() });
-    }
+function repostListRef(channelId) {
+  return db.collection('repostLists').doc(String(channelId));
+}
 
-    // Global index lets Admin -> Create Post -> Repost find posts without Topic ID.
-    await db.collection('channelPosts').add({
-      ...record,
-      topicId: String(topicId),
-      createdAt: Date.now()
+function withRepostLock(key, fn) {
+  const prev = repostLocks.get(key) || Promise.resolve();
+  const run = prev.catch(() => {}).then(fn);
+  const tail = run.catch(() => {});
+  repostLocks.set(key, tail);
+  tail.then(() => { if (repostLocks.get(key) === tail) repostLocks.delete(key); });
+  return run;
+}
+
+async function loadRepostList(channelId) {
+  const key = String(channelId);
+  const cached = repostListCache.get(key);
+  if (cached && (Date.now() - cached.at) < REPOST_CACHE_TTL) return cached.items;
+  const snap = await repostListRef(key).get();
+  const items = snap.exists && Array.isArray(snap.data().items) ? snap.data().items : [];
+  repostListCache.set(key, { items, at: Date.now() });
+  return items;
+}
+
+async function persistRepostList(channelId, items) {
+  const key = String(channelId);
+  await repostListRef(key).set({ items, updatedAt: Date.now() });
+  repostListCache.set(key, { items, at: Date.now() });
+}
+
+async function normalizeRepostEntry(e) {
+  const clean = v => String(v || '').replace(/\s+/g, ' ').trim();
+  const caption = clean(e.caption);
+  let title = clean(e.title);
+  const topicId = e.topicId && e.topicId !== 'repost' ? String(e.topicId) : '';
+  // Topic name is searchable too — taken from the (cached) topic, no extra read in the common case.
+  if (!title && topicId) {
+    try { const t = await getSingleTopicCached(topicId); if (t && t.title) title = clean(t.title); } catch (_) {}
+  }
+  return {
+    messageId: Number(e.messageId),
+    topicId,
+    type: e.type || 'video',
+    caption: safeTruncate(caption, 120),
+    title: title && title !== caption ? safeTruncate(title, 60) : '',
+    savedAt: Date.now()
+  };
+}
+
+// entries: [{ channelId, messageId, type, caption, title, topicId }]
+async function saveRepostEntries(entries) {
+  const result = { saved: 0, duplicates: 0, full: 0 };
+  const byChannel = new Map();
+  for (const e of entries || []) {
+    if (!e || !e.channelId || !e.messageId) continue;
+    const key = String(e.channelId);
+    if (!byChannel.has(key)) byChannel.set(key, []);
+    byChannel.get(key).push(e);
+  }
+  for (const [channelId, list] of byChannel) {
+    const normalized = [];
+    for (const e of list) normalized.push(await normalizeRepostEntry(e));
+    await withRepostLock(channelId, async () => {
+      const items = (await loadRepostList(channelId)).slice();
+      let changed = false;
+      for (const n of normalized) {
+        if (items.some(x => Number(x.messageId) === n.messageId)) { result.duplicates++; continue; }
+        if (items.length >= REPOST_LIST_MAX) { result.full++; continue; }
+        items.push(n);
+        result.saved++;
+        changed = true;
+      }
+      if (changed) await persistRepostList(channelId, items); // ONE write for the whole batch
     });
-    invalidateTopicsCache();
-    cleanupChannelPosts(channelId).catch(e => console.error('❌ channelPosts cleanup error:', e.message));
-  } catch (e) {
-    console.error('❌ Could not record channel post:', e.message);
   }
+  return result;
 }
 
-// This is a safety net against runaway/unbounded growth, not a real limit —
-// at 2000 kept per channel it should never trigger in normal day-to-day use,
-// so no repost history is lost. Cleanup is scoped per-channel now (not
-// globally), so a channel you post to often can never crowd out or cause the
-// cleanup of another channel's saved posts.
-const CHANNEL_POSTS_CAP_PER_CHANNEL = 2000;
-async function cleanupChannelPosts(channelId) {
-  const wanted = String(channelId);
-  const countSnap = await db.collection('channelPosts').where('channelId', '==', wanted).count().get();
-  const total = countSnap.data().count || 0;
-  if (total <= CHANNEL_POSTS_CAP_PER_CHANNEL) return;
-  const excess = total - CHANNEL_POSTS_CAP_PER_CHANNEL;
-  const oldSnap = await db.collection('channelPosts')
-    .where('channelId', '==', wanted)
-    .orderBy('postedAt', 'asc')
-    .limit(excess)
-    .get();
-  if (oldSnap.empty) return;
-  const batch = db.batch();
-  oldSnap.docs.forEach(d => batch.delete(d.ref));
-  await batch.commit();
+async function removeRepostItems(channelId, messageIds) {
+  const ids = new Set((messageIds || []).map(Number));
+  if (!ids.size) return 0;
+  let removed = 0;
+  await withRepostLock(String(channelId), async () => {
+    const items = await loadRepostList(channelId);
+    const next = items.filter(x => !ids.has(Number(x.messageId)));
+    removed = items.length - next.length;
+    if (removed > 0) await persistRepostList(channelId, next);
+  });
+  return removed;
 }
 
-// 📢 Repost list hygiene ---------------------------------------------------
-// Messages that must NEVER show up in the Repost list: the copies the bot
-// itself creates when reposting, and old posts that no longer exist in the
-// channel. They're remembered per channel (one small doc, arrayUnion) so the
-// list stays clean no matter which code path or old record tries to add them.
-async function hideFromRepostList(channelId, messageId) {
-  if (!channelId || !messageId) return;
-  try {
-    await db.collection('repostHidden').doc(String(channelId)).set({
-      ids: admin.firestore.FieldValue.arrayUnion(Number(messageId)),
-      updatedAt: Date.now()
-    }, { merge: true });
-  } catch (e) {
-    console.error('❌ hideFromRepostList error:', e.message);
-  }
+function dropRepostList(channelId) {
+  repostListCache.delete(String(channelId));
+  return repostListRef(channelId).delete();
 }
 
-async function getRepostHiddenIds(channelId) {
-  try {
-    const ref = db.collection('repostHidden').doc(String(channelId));
-    const snap = await ref.get();
-    let ids = snap.exists && Array.isArray(snap.data().ids) ? snap.data().ids.map(Number).filter(Number.isFinite) : [];
-    if (ids.length > 6000) {
-      // Keep the list from growing forever: message IDs only ever increase, so
-      // the highest ones are the ones that can still appear in the list.
-      ids = ids.sort((a, b) => a - b).slice(-3000);
-      ref.set({ ids, updatedAt: Date.now() }, { merge: true }).catch(() => {});
-    }
-    return new Set(ids);
-  } catch (e) {
-    console.warn('⚠️ Could not read repost hidden ids:', e.message);
-    return new Set();
-  }
-}
-
-function repostSignature(p) {
-  const hasTopic = p.topicId && p.topicId !== 'repost';
-  const cap = String(p.caption || p.title || '').replace(/\s+/g, ' ').trim().toLowerCase();
-  if (!hasTopic && !cap) return `msg:${p.messageId}`; // nothing to compare → keep separate
-  return `${hasTopic ? p.topicId : ''}|${p.type || ''}|${cap}`;
-}
-
+// Newest first. Returns a fresh array (the cached one is never mutated).
 async function getRepostPostsForChannel(channelId) {
-  const wanted = String(channelId || '');
-  const map = new Map();
-
-  // New global records: caption + exact message metadata are available.
-  // Filtered by channelId *in the query itself* — not fetched-then-filtered —
-  // so a channel you post to less often never gets crowded out of the most
-  // recent 300 posts by a channel you post to constantly.
-  try {
-    const snap = await db.collection('channelPosts')
-      .where('channelId', '==', wanted)
-      .orderBy('postedAt', 'desc')
-      .limit(300)
-      .get();
-    snap.docs.forEach(doc => {
-      const d = doc.data() || {};
-      const key = `${d.channelId}:${d.messageId}`;
-      if (!map.has(key)) map.set(key, { id: doc.id, ...d, legacy: false });
-    });
-  } catch (e) {
-    console.warn('⚠️ channelPosts index unavailable:', e.message);
-  }
-
-  // Legacy topic-level records: posts saved by older versions of the bot,
-  // before the channelPosts index existed. Always merged in (not just when
-  // the new index is empty) so a channel's oldest posts never silently
-  // disappear from the Repost list just because it also has newer posts.
-  const topics = await getTopicsCached();
-  topics.forEach(t => {
-      const records = Array.isArray(t.postRecords) ? t.postRecords : [];
-      records.forEach(r => {
-        if (String(r.channelId) !== wanted || !r.messageId) return;
-        const key = `${r.channelId}:${r.messageId}`;
-        if (!map.has(key)) {
-          map.set(key, {
-            channelId: String(r.channelId),
-            messageId: Number(r.messageId),
-            type: r.type || 'video',
-            caption: String(r.caption || ''),
-            title: String(r.title || t.title || ''),
-            topicId: t.id,
-            postedAt: Number(r.postedAt) || 0,
-            legacy: true
-          });
-        }
-      });
-    });
-
-  // 1) Drop copies made by Repost itself + posts known to be gone.
-  const hidden = await getRepostHiddenIds(wanted);
-  const sorted = Array.from(map.values())
-    .filter(p => !hidden.has(Number(p.messageId)))
-    .sort((a,b) => (Number(b.postedAt)||0) - (Number(a.postedAt)||0));
-
-  // 2) One button per piece of content. The same topic + caption + media type
-  // can be recorded several times (scheduled repeats, posting again, records
-  // left over from older versions) — that's what showed up as duplicate
-  // buttons. Keep the NEWEST as the button and remember the older message IDs
-  // as fallbacks in case the newest was deleted from the channel.
-  const groups = new Map();
-  for (const p of sorted) {
-    const sig = repostSignature(p);
-    const g = groups.get(sig);
-    if (!g) groups.set(sig, { ...p, fallbackIds: [], duplicateCount: 1 });
-    else { g.fallbackIds.push(Number(p.messageId)); g.duplicateCount++; }
-  }
-  return Array.from(groups.values());
+  const items = await loadRepostList(channelId);
+  return items
+    .map(x => ({ ...x, channelId: String(channelId) }))
+    .sort((a, b) => (Number(b.savedAt) || 0) - (Number(a.savedAt) || 0));
 }
+
+// Search by Topic ID or by name/caption — all words must match.
+function filterRepostItems(items, query) {
+  const terms = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return items;
+  const q = terms.join(' ');
+  const hits = items.filter(p => {
+    const hay = `${p.topicId || ''} ${p.title || ''} ${p.caption || ''}`.toLowerCase();
+    return terms.every(t => hay.includes(t));
+  });
+  // exact Topic ID matches first
+  return hits.sort((a, b) => (String(b.topicId).toLowerCase() === q ? 1 : 0) - (String(a.topicId).toLowerCase() === q ? 1 : 0));
+}
+
+// 💾 "Save" button shown under the post result. Entries are held in memory
+// (no Firestore) until you tap Save.
+const pendingRepostSaves = new Map(); // token -> { entries, at }
+function registerPendingSave(entries) {
+  const list = (entries || []).filter(e => e && e.channelId && e.messageId);
+  if (!list.length) return null;
+  const now = Date.now();
+  for (const [k, v] of pendingRepostSaves) if (now - v.at > 48 * 60 * 60 * 1000) pendingRepostSaves.delete(k);
+  while (pendingRepostSaves.size >= 300) pendingRepostSaves.delete(pendingRepostSaves.keys().next().value);
+  const token = crypto.randomBytes(4).toString('hex');
+  pendingRepostSaves.set(token, { entries: list, at: now });
+  return token;
+}
+
+function postDoneMarkup(entries, label) {
+  const rows = [];
+  const token = registerPendingSave(entries);
+  if (token) rows.push([Markup.button.callback(label || '💾 Repost List-এ Save করুন', 'rsave:' + token)]);
+  rows.push([Markup.button.callback('🏠 Admin Panel', 'adm_home')]);
+  return Markup.inlineKeyboard(rows).reply_markup;
+}
+
+bot.action(/^rsave:([a-f0-9]+)$/, async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const token = ctx.match[1];
+  const pending = pendingRepostSaves.get(token);
+  if (!pending) {
+    return ctx.answerCbQuery('ℹ️ আগেই Save হয়ে গেছে, অথবা মেয়াদ শেষ। Admin → Repost → "Forward করে যোগ করুন" ব্যবহার করুন।', { show_alert: true });
+  }
+  pendingRepostSaves.delete(token);
+  try {
+    const r = await saveRepostEntries(pending.entries);
+    let msg = r.saved ? `✅ ${r.saved}টি Repost List-এ Save হয়েছে` : (r.duplicates ? 'ℹ️ আগে থেকেই List-এ আছে' : '⚠️ Save হয়নি');
+    if (r.full) msg += ` (List full — ${r.full}টি বাদ, পুরোনো কিছু Delete করুন)`;
+    await ctx.answerCbQuery(msg, { show_alert: !!r.full });
+    await ctx.editMessageReplyMarkup(Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup).catch(() => {});
+  } catch (e) {
+    console.error('❌ rsave error:', e.message);
+    pendingRepostSaves.set(token, pending); // let the admin retry
+    return ctx.answerCbQuery('❌ Save করা যায়নি, আবার চেষ্টা করুন');
+  }
+});
 
 bot.action(/^sched_repeat:(none|daily|weekly)$/, async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
@@ -2060,6 +2063,7 @@ bot.action('post_confirm', async (ctx) => {
   try {
     const keyboard = await buildConfiguredPostKeyboard(state.topicId);
     const lines = [];
+    const saveEntries = [];
 
     for (const postingChannel of postingChannels) {
       try {
@@ -2075,7 +2079,7 @@ bot.action('post_confirm', async (ctx) => {
             reply_markup: keyboard.reply_markup
           });
         }
-        await recordTopicPost(state.topicId, postingChannel, sent.message_id, state.type, state.caption || '', state.topicId);
+        saveEntries.push({ channelId: postingChannel, messageId: sent.message_id, type: state.type, caption: state.caption || '', title: '', topicId: state.topicId });
         lines.push(`✅ ${postingChannel} — Message ID: ${sent.message_id}`);
       } catch (chErr) {
         console.error(`❌ /post publish error [${postingChannel}]:`, chErr.message);
@@ -2088,7 +2092,7 @@ bot.action('post_confirm', async (ctx) => {
       `📤 Post সম্পন্ন হয়েছে (${postingChannels.length}টি Channel):\n\n` +
       `🆔 Video/Topic ID: <code>${escapeHtml(state.topicId)}</code>\n\n` +
       escapeHtml(lines.join('\n')),
-      { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup }
+      { parse_mode: 'HTML', reply_markup: postDoneMarkup(saveEntries) }
     );
   } catch (error) {
     console.error('❌ /post publish error:', error);
@@ -2629,7 +2633,7 @@ bot.action(/^vipdays:(\d+|custom)$/, async ctx => {
   return mode === 'set' ? setVipSubscription(ctx, targetId, days) : grantVipSubscription(ctx, targetId, days);
 });
 
-bot.action(/^apostch_topic:([^:]+):(.+)$/, async ctx=>{ if(!adminOnly(ctx))return ctx.answerCbQuery('❌'); delete adminVideoData[ctx.from.id]; let ch=ctx.match[1]; const doc=await db.collection('channels').doc(ch).get(); if(doc.exists)ch=doc.data().channelId; const topicId=ctx.match[2]; const td=await db.collection('topics').doc(topicId).get(); if(!td.exists)return ctx.answerCbQuery('❌ Video নেই'); const t=td.data(); const fileId=(t.videos&&t.videos[0])||t.videoId||''; if(!fileId)return ctx.answerCbQuery('❌ Video file পাওয়া যায়নি'); const kb=await buildConfiguredPostKeyboard(topicId); await ctx.answerCbQuery('Posting...'); try{const sent=await bot.telegram.sendVideo(ch,fileId,{caption:t.title||'',reply_markup:kb.reply_markup}); await recordTopicPost(topicId,ch,sent.message_id,'video',t.title||'',t.title||''); return ctx.reply(`✅ Post হয়েছে\n📢 ${ch}\n🆔 Message ID: ${sent.message_id}`, { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup });}catch(e){return ctx.reply('❌ Channel-এ post করা যায়নি: '+e.message);} });
+bot.action(/^apostch_topic:([^:]+):(.+)$/, async ctx=>{ if(!adminOnly(ctx))return ctx.answerCbQuery('❌'); delete adminVideoData[ctx.from.id]; let ch=ctx.match[1]; const doc=await db.collection('channels').doc(ch).get(); if(doc.exists)ch=doc.data().channelId; const topicId=ctx.match[2]; const td=await db.collection('topics').doc(topicId).get(); if(!td.exists)return ctx.answerCbQuery('❌ Video নেই'); const t=td.data(); const fileId=(t.videos&&t.videos[0])||t.videoId||''; if(!fileId)return ctx.answerCbQuery('❌ Video file পাওয়া যায়নি'); const kb=await buildConfiguredPostKeyboard(topicId); await ctx.answerCbQuery('Posting...'); try{const sent=await bot.telegram.sendVideo(ch,fileId,{caption:t.title||'',reply_markup:kb.reply_markup}); return ctx.reply(`✅ Post হয়েছে\n📢 ${ch}\n🆔 Message ID: ${sent.message_id}`, { reply_markup: postDoneMarkup([{ channelId: ch, messageId: sent.message_id, type: 'video', caption: t.title||'', title: t.title||'', topicId }]) });}catch(e){return ctx.reply('❌ Channel-এ post করা যায়নি: '+e.message);} });
 
 // =============================================
 // 📢 REPOST: Channel -> saved captions -> instant copy
@@ -2642,19 +2646,22 @@ bot.action(/^repost_channel:(\d+|default)$/, async ctx => {
     ? { channelId: POST_CHANNEL, name: 'Posting Channel' }
     : channels[Number(key)];
 
-  if (!channel || !channel.channelId) return ctx.answerCbQuery('❌ Channel পাওয়া যায়নি');
+  if (!channel || !channel.channelId) return ctx.answerCbQuery('❌ Channel পাওয়া যায়নি');
   const channelId = String(channel.channelId);
   await ctx.answerCbQuery();
 
-  const posts = await getRepostPostsForChannel(channelId);
-  if (!posts.length) {
+  const all = await getRepostPostsForChannel(channelId);
+  if (!all.length) {
     return ctx.editMessageText(
-      `📢 ${channel.name || channelId}\n\n📭 এই Channel-এর কোনো saved Post পাওয়া যায়নি।\n\nনতুন Post করলে পরের বার Repost list-এ থাকবে।`,
+      `📢 ${channel.name || channelId}\n\n📭 Repost list খালি।\n\nPost করার পর আসা "💾 Save" বাটনে চাপলে অথবা "📥 Forward করে যোগ করুন" দিয়ে এখানে যোগ করতে পারবেন।`,
       Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'adm_repost')]])
     );
   }
 
-  repostData[ctx.from.id] = { step: 'post', channelId, channelName: channel.name || channelId, posts, page: 1 };
+  repostData[ctx.from.id] = {
+    step: 'post', channelId, channelName: channel.name || channelId,
+    all, posts: all, page: 1, query: '', deleteMode: false, awaitingSearch: false
+  };
   return renderRepostPage(ctx, ctx.from.id, 1);
 });
 
@@ -2666,9 +2673,11 @@ const repostInFlight = new Map();
 function repostLockKey(userId, rec) {
   return `${String(userId)}:${String(rec.channelId)}:${String(rec.messageId)}`;
 }
-function renderRepostPage(ctx, userId, page) {
+
+// fresh=true → send as a NEW message (used after typed text, e.g. a search).
+function renderRepostPage(ctx, userId, page, fresh = false) {
   const state = repostData[userId];
-  if (!state || !state.posts) return ctx.answerCbQuery('❌ Repost data পাওয়া যায়নি');
+  if (!state || !state.posts) return ctx.answerCbQuery('❌ Repost data পাওয়া যায়নি').catch(() => {});
   const posts = state.posts;
   const totalPages = Math.max(1, Math.ceil(posts.length / REPOST_PAGE_SIZE));
   page = Math.min(Math.max(1, page), totalPages);
@@ -2680,24 +2689,127 @@ function renderRepostPage(ctx, userId, page) {
     const globalIndex = start + i;
     const caption = String(p.caption || p.title || '(Caption নেই)').replace(/\s+/g, ' ').trim();
     const media = p.type === 'photo' ? '🖼️' : '🎬';
-    const date = p.postedAt ? new Date(Number(p.postedAt)).toLocaleDateString('en-GB') : '';
-    return [Markup.button.callback(`${media} ${safeTruncate(caption, 48)}${date ? ` • ${date}` : ''}`, `repost_post:${globalIndex}`)];
+    const date = p.savedAt ? new Date(Number(p.savedAt)).toLocaleDateString('en-GB') : '';
+    const label = `${state.deleteMode ? '🗑' : media} ${safeTruncate(caption, 46)}${date ? ` • ${date}` : ''}`;
+    return [Markup.button.callback(label, state.deleteMode ? `repost_del:${p.messageId}` : `repost_post:${globalIndex}`)];
   });
 
   const navRow = [];
-  if (page > 1) navRow.push(Markup.button.callback('⬅️ আগের পেজ', 'repost_page:'+(page-1)));
-  if (page < totalPages) navRow.push(Markup.button.callback('পরের পেজ ➡️', 'repost_page:'+(page+1)));
+  if (page > 1) navRow.push(Markup.button.callback('⬅️ আগের পেজ', 'repost_page:' + (page - 1)));
+  if (page < totalPages) navRow.push(Markup.button.callback('পরের পেজ ➡️', 'repost_page:' + (page + 1)));
   if (navRow.length) rows.push(navRow);
+
+  rows.push([
+    Markup.button.callback('🔍 Search', 'repost_search'),
+    state.deleteMode ? Markup.button.callback('✅ Delete শেষ', 'repost_delmode:off') : Markup.button.callback('🗑 Delete Mode', 'repost_delmode:on')
+  ]);
+  if (state.query) rows.push([Markup.button.callback('❌ Search মুছে সব দেখুন', 'repost_search_clear')]);
+  if (state.deleteMode && posts.length) rows.push([Markup.button.callback(`🧹 এই ${posts.length}টি সব মুছুন`, 'repost_clear_ask')]);
   rows.push([Markup.button.callback('⬅️ Channel Select', 'adm_repost')]);
 
-  const text = `📢 ${state.channelName || state.channelId}\n\nযে Caption-এর Post Repost করতে চান সেটিতে চাপুন:\n📄 পেজ ${page}/${totalPages} (মোট ${posts.length}টি)`;
-  return ctx.editMessageText(text, Markup.inlineKeyboard(rows)).catch(() => ctx.reply(text, Markup.inlineKeyboard(rows)));
+  let text = `📢 ${state.channelName || state.channelId}\n`;
+  if (state.query) text += `🔍 "${safeTruncate(state.query, 40)}" — ${posts.length}টি পাওয়া গেছে (list-এ মোট ${state.all.length}টি)\n`;
+  text += '\n';
+  if (!posts.length) {
+    text += state.query ? '📭 কিছু পাওয়া যায়নি। অন্য Topic ID / নাম দিয়ে আবার Search করুন।' : '📭 List এখন খালি।';
+  } else if (state.deleteMode) {
+    text += '🗑 DELETE MODE\nযেটায় চাপবেন সেটা Repost list থেকে মুছে যাবে (Channel-এর আসল Post মুছবে না)।';
+  } else {
+    text += 'যে Post Repost করতে চান সেটিতে চাপুন:';
+  }
+  text += `\n📄 পেজ ${page}/${totalPages} (দেখাচ্ছে ${posts.length}টি)`;
+  const markup = Markup.inlineKeyboard(rows);
+  if (fresh) return ctx.reply(text, markup);
+  return ctx.editMessageText(text, markup).catch(() => ctx.reply(text, markup));
 }
 
 bot.action(/^repost_page:(\d+)$/, async ctx => {
   if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
   await ctx.answerCbQuery();
   return renderRepostPage(ctx, ctx.from.id, Number(ctx.match[1]));
+});
+
+// 🔍 Search the saved list (Topic ID or name/caption). Runs on the cached list: 0 Firestore reads.
+bot.action('repost_search', async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const state = repostData[ctx.from.id];
+  if (!state || state.step !== 'post') return ctx.answerCbQuery('❌ Repost data পাওয়া যায়নি');
+  state.awaitingSearch = true;
+  await ctx.answerCbQuery();
+  return ctx.reply('🔍 Topic ID অথবা নাম/Caption-এর কিছু অংশ লিখে পাঠান।\n\nযেমন: 105  অথবা  নাম-এর একটা শব্দ\n(বাতিল করতে /cancel)');
+});
+
+bot.action('repost_search_clear', async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const state = repostData[ctx.from.id];
+  if (!state || state.step !== 'post') return ctx.answerCbQuery('❌ Repost data পাওয়া যায়নি');
+  state.query = ''; state.posts = state.all; state.awaitingSearch = false;
+  await ctx.answerCbQuery();
+  return renderRepostPage(ctx, ctx.from.id, 1);
+});
+
+bot.action(/^repost_delmode:(on|off)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const state = repostData[ctx.from.id];
+  if (!state || state.step !== 'post') return ctx.answerCbQuery('❌ Repost data পাওয়া যায়নি');
+  state.deleteMode = ctx.match[1] === 'on';
+  await ctx.answerCbQuery(state.deleteMode ? '🗑 Delete Mode চালু' : '✅ বন্ধ');
+  return renderRepostPage(ctx, ctx.from.id, state.page || 1);
+});
+
+// Removes ONE entry from the list (the Channel post itself is untouched).
+async function deleteRepostEntryFromState(ctx, messageId) {
+  const state = repostData[ctx.from.id];
+  if (!state || state.step !== 'post') return ctx.answerCbQuery('❌ Repost data পাওয়া যায়নি');
+  const mid = Number(messageId);
+  if (!state.all.some(p => Number(p.messageId) === mid)) {
+    await ctx.answerCbQuery('ℹ️ আগেই মুছে গেছে');
+    return renderRepostPage(ctx, ctx.from.id, state.page || 1);
+  }
+  state.all = state.all.filter(p => Number(p.messageId) !== mid);
+  state.posts = state.posts.filter(p => Number(p.messageId) !== mid);
+  await ctx.answerCbQuery('🗑 List থেকে মুছে গেছে');
+  try { await removeRepostItems(state.channelId, [mid]); } catch (e) { console.error('❌ repost delete error:', e.message); }
+  return renderRepostPage(ctx, ctx.from.id, state.page || 1);
+}
+
+bot.action(/^repost_del:(\d+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  return deleteRepostEntryFromState(ctx, ctx.match[1]);
+});
+bot.action(/^repost_del1:(\d+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  return deleteRepostEntryFromState(ctx, ctx.match[1]);
+});
+
+bot.action('repost_clear_ask', async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const state = repostData[ctx.from.id];
+  if (!state || state.step !== 'post' || !state.posts.length) return ctx.answerCbQuery('❌ কিছু নেই');
+  await ctx.answerCbQuery();
+  return ctx.editMessageText(
+    `⚠️ আপনি কি নিশ্চিত?\n\n📢 ${state.channelName}\n${state.query ? `🔍 "${safeTruncate(state.query, 40)}" এর ` : ''}${state.posts.length}টি entry Repost list থেকে মুছে যাবে।\n\n(Channel-এর আসল Post মুছবে না। ফেরত আনা যাবে না।)`,
+    Markup.inlineKeyboard([[Markup.button.callback('✅ হ্যাঁ, মুছুন', 'repost_clear_yes'), Markup.button.callback('❌ বাতিল', 'repost_delmode:on')]])
+  );
+});
+
+bot.action('repost_clear_yes', async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const state = repostData[ctx.from.id];
+  if (!state || state.step !== 'post') return ctx.answerCbQuery('❌ Repost data পাওয়া যায়নি');
+  const ids = state.posts.map(p => Number(p.messageId));
+  const idSet = new Set(ids);
+  try {
+    await removeRepostItems(state.channelId, ids); // ONE write, however many
+  } catch (e) {
+    console.error('❌ repost clear error:', e.message);
+    return ctx.answerCbQuery('❌ মোছা যায়নি');
+  }
+  state.all = state.all.filter(p => !idSet.has(Number(p.messageId)));
+  state.posts = state.query ? filterRepostItems(state.all, state.query) : state.all;
+  state.deleteMode = false;
+  await ctx.answerCbQuery(`🧹 ${ids.length}টি মুছে গেছে`);
+  return renderRepostPage(ctx, ctx.from.id, 1);
 });
 
 bot.action(/^repost_post:(\d+)$/, async ctx => {
@@ -2709,12 +2821,13 @@ bot.action(/^repost_post:(\d+)$/, async ctx => {
   }
   const rec = state.posts[index];
   await ctx.answerCbQuery();
-  const date = rec.postedAt ? new Date(Number(rec.postedAt)).toLocaleDateString('en-GB') : 'অজানা';
+  const date = rec.savedAt ? new Date(Number(rec.savedAt)).toLocaleDateString('en-GB') : 'অজানা';
   const media = rec.type === 'photo' ? '🖼️ Photo' : '🎬 Video';
   return ctx.editMessageText(
-    `⚠️ Repost Preview — ঠিক আছে তো?\n\n📢 Channel: ${rec.channelId}\n📦 Type: ${media}\n📅 আগে posted: ${date}\n📝 Caption:\n${String(rec.caption || rec.title || '(Caption নেই)').slice(0, 400)}`,
+    `⚠️ Repost Preview — ঠিক আছে তো?\n\n📢 Channel: ${rec.channelId}\n📦 Type: ${media}\n${rec.topicId ? `🆔 Topic ID: ${rec.topicId}\n` : ''}📅 Save করা হয়েছে: ${date}\n📝 Caption:\n${String(rec.caption || rec.title || '(Caption নেই)').slice(0, 400)}`,
     Markup.inlineKeyboard([
-      [Markup.button.callback('✅ হ্যাঁ, Repost করুন', 'repost_confirm:'+index), Markup.button.callback('❌ বাতিল', 'adm_repost')]
+      [Markup.button.callback('✅ হ্যাঁ, Repost করুন', 'repost_confirm:' + index), Markup.button.callback('⬅️ ফিরে যান', 'repost_page:' + (state.page || 1))],
+      [Markup.button.callback('🗑 List থেকে Delete', 'repost_del1:' + rec.messageId)]
     ])
   );
 });
@@ -2744,9 +2857,8 @@ bot.action(/^repost_confirm:(\d+)$/, async ctx => {
 
   try {
     // NOTE: Telegram's copyMessage does NOT carry over the original inline
-    // keyboard unless it is passed explicitly via reply_markup. That was the
-    // cause of reposts losing their buttons. We rebuild the same configured
-    // keyboard here using the post's saved topicId, like a fresh post gets.
+    // keyboard unless it is passed explicitly via reply_markup. We rebuild the
+    // configured keyboard here using the post's saved topicId.
     const copyOptions = {};
     if (rec.topicId && rec.topicId !== 'repost') {
       const kb = await buildConfiguredPostKeyboard(rec.topicId);
@@ -2755,34 +2867,28 @@ bot.action(/^repost_confirm:(\d+)$/, async ctx => {
       }
     }
 
-    // Try the newest saved message first; if it was deleted from the channel,
-    // fall back to older copies of the same post and forget the dead ones.
-    const candidates = [Number(rec.messageId), ...(Array.isArray(rec.fallbackIds) ? rec.fallbackIds : [])];
     const goneRe = /message to copy not found|message not found|MESSAGE_ID_INVALID|message can't be copied/i;
-    let copied = null;
-    let lastError = null;
-    for (const sourceMessageId of candidates) {
-      try {
-        copied = await bot.telegram.copyMessage(rec.channelId, rec.channelId, sourceMessageId, copyOptions);
-        break;
-      } catch (copyErr) {
-        lastError = copyErr;
-        if (goneRe.test(copyErr.message || '')) {
-          hideFromRepostList(rec.channelId, sourceMessageId); // dead post — never list it again
-          continue;
-        }
-        throw copyErr; // a real error (permissions, rate limit …) — don't hammer the other IDs
+    let copied;
+    try {
+      copied = await bot.telegram.copyMessage(rec.channelId, rec.channelId, Number(rec.messageId), copyOptions);
+    } catch (copyErr) {
+      if (goneRe.test(copyErr.message || '')) {
+        // The original was deleted from the channel — drop it from the list.
+        removeRepostItems(rec.channelId, [rec.messageId]).catch(() => {});
+        state.all = state.all.filter(p => Number(p.messageId) !== Number(rec.messageId));
+        state.posts = state.posts.filter(p => Number(p.messageId) !== Number(rec.messageId));
+        throw new Error('এই Post Channel থেকে মুছে গেছে, তাই List থেকেও সরিয়ে দেওয়া হয়েছে।');
       }
+      throw copyErr;
     }
-    if (!copied) throw (lastError || new Error('Post পাওয়া যায়নি'));
 
-    // IMPORTANT: A reposted message must NOT be added back to the Repost source
-    // list. The new copy's ID is remembered as "hidden" so that even if some
-    // other path (an old record, a forward, a channel update) tries to add it,
-    // it can never appear as a duplicate button.
-    await hideFromRepostList(rec.channelId, copied.message_id);
     delete repostData[ctx.from.id];
-    return ctx.reply(`✅ Post আবার Repost হয়েছে (বাটনসহ)।\n\n📢 ${rec.channelId}\n📝 ${String(rec.caption || rec.title || '(Caption নেই)').slice(0, 300)}\n🆔 নতুন Message ID: ${copied.message_id}`, { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup });
+    // The new copy is NOT auto-saved. If you plan to delete the old post from the
+    // channel, tap the Save button so the new copy stays in the list.
+    return ctx.reply(
+      `✅ Post আবার Repost হয়েছে (বাটনসহ)।\n\n📢 ${rec.channelId}\n📝 ${String(rec.caption || rec.title || '(Caption নেই)').slice(0, 300)}\n🆔 নতুন Message ID: ${copied.message_id}`,
+      { reply_markup: postDoneMarkup([{ channelId: rec.channelId, messageId: copied.message_id, type: rec.type, caption: rec.caption, title: rec.title, topicId: rec.topicId }], '💾 নতুন Post-টাও List-এ Save করুন') }
+    );
   } catch (e) {
     console.error('❌ Repost error:', e.message);
     return ctx.reply(`❌ Repost করা যায়নি।\n\n📢 ${rec.channelId}\n🆔 Message ID: ${rec.messageId}\n\n${e.message}`);
@@ -2822,16 +2928,11 @@ bot.action(/^ach_del_confirm:(.+)$/, async ctx=>{
   try { await db.collection('channels').doc(id).delete(); } catch (e) { console.error('❌ Channel delete error:', e.message); }
   invalidateChannelsCache();
 
-  // Clean up orphaned repost records for this channel so old history doesn't linger.
+  // Clean up this channel's saved Repost list (single doc).
   try {
-    const snap = await db.collection('channelPosts').where('channelId', '==', channelIdToClean).get();
-    if (!snap.empty) {
-      const batch = db.batch();
-      snap.docs.forEach(d => batch.delete(d.ref));
-      await batch.commit();
-    }
+    await dropRepostList(channelIdToClean);
   } catch (e) {
-    console.error('❌ channelPosts cleanup error:', e.message);
+    console.error('❌ repost list cleanup error:', e.message);
   }
 
   await ctx.answerCbQuery('Deleted');
@@ -3467,6 +3568,16 @@ bot.on('text', async (ctx) => {
 
   if (await handleForwardedRepostCapture(ctx)) return;
 
+  // 🔍 Repost list search (typed text) — runs on the cached list, 0 Firestore reads.
+  if (userId === ADMIN_ID && repostData[userId] && repostData[userId].awaitingSearch) {
+    const st = repostData[userId];
+    st.awaitingSearch = false;
+    st.query = safeTruncate(text, 80);
+    st.posts = filterRepostItems(st.all, st.query);
+    st.deleteMode = false;
+    return renderRepostPage(ctx, userId, 1, true);
+  }
+
   if (postData[userId] && postData[userId].step === 'general_caption') {
     const gSkip = text.toLowerCase() === 'skip';
     postData[userId].caption = gSkip ? '' : ctx.message.text;
@@ -3497,15 +3608,21 @@ bot.on('text', async (ctx) => {
     let topicId = '';
     let title = '';
     if (text.toLowerCase() !== 'skip') {
-      const d = await db.collection('topics').doc(text).get();
-      if (!d.exists) {
+      const t = await getSingleTopicCached(text);
+      if (!t) {
         await ctx.reply(`⚠️ "${escapeHtml(text)}" নামে কোনো Video/Topic পাওয়া যায়নি, তাই বাটন ছাড়াই যোগ করা হচ্ছে।`, { parse_mode: 'HTML' });
       } else {
         topicId = text;
-        title = d.data().title || '';
+        title = t.title || '';
       }
     }
-    await recordTopicPost(topicId || 'repost', pending.channelId, pending.messageId, pending.type, pending.caption, title);
+    const saveRes = await saveRepostEntries([{ channelId: pending.channelId, messageId: pending.messageId, type: pending.type, caption: pending.caption, title, topicId }]);
+    if (!saveRes.saved) {
+      return ctx.reply(
+        saveRes.full ? '⚠️ Repost list full হয়ে গেছে। আগে পুরোনো কিছু Delete করুন।' : 'ℹ️ এই Post আগে থেকেই Repost list-এ আছে।',
+        Markup.inlineKeyboard([[Markup.button.callback('📢 Repost Menu', 'adm_repost')]])
+      );
+    }
     return ctx.reply(
       `✅ Repost list-এ যোগ হয়েছে।\n\n📢 ${escapeHtml(String(pending.channelId))}\n🆔 Message ID: <code>${escapeHtml(String(pending.messageId))}</code>${topicId ? `\n🔗 Video/Topic: <code>${escapeHtml(topicId)}</code>` : ''}`,
       { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('📢 Repost Menu', 'adm_repost')]]) }
@@ -5039,6 +5156,7 @@ async function firePostSchedule(docId) {
   const now = Date.now();
   const channels = Array.isArray(sp.channels) && sp.channels.length ? sp.channels : (POST_CHANNEL ? [POST_CHANNEL] : []);
   const lines = [];
+  const saveEntries = [];
   try {
     const keyboard = await buildConfiguredPostKeyboard(sp.topicId);
     for (const channelId of channels) {
@@ -5049,7 +5167,7 @@ async function firePostSchedule(docId) {
         } else {
           sent = await bot.telegram.sendPhoto(channelId, sp.fileId, { ...captionExtra(sp.caption, sp.captionEntities), reply_markup: keyboard.reply_markup });
         }
-        await recordTopicPost(sp.topicId, channelId, sent.message_id, sp.type, sp.caption || '', sp.topicId);
+        saveEntries.push({ channelId, messageId: sent.message_id, type: sp.type, caption: sp.caption || '', title: sp.title || '', topicId: sp.topicId });
         lines.push(`✅ ${channelId} — Message ID: ${sent.message_id}`);
       } catch (chErr) {
         console.error(`❌ Scheduled post error [${channelId}]:`, chErr.message);
@@ -5079,7 +5197,7 @@ async function firePostSchedule(docId) {
     await safeSendMessage(
       ADMIN_ID,
       `🕒 Scheduled Post সম্পন্ন হয়েছে\n\n📌 Title: ${escapeHtml(sp.title || 'নামবিহীন ভিডিও')}\n🆔 Video/Topic ID: <code>${escapeHtml(sp.topicId)}</code>\n\n${escapeHtml(lines.join('\n'))}`,
-      { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup }
+      { parse_mode: 'HTML', reply_markup: postDoneMarkup(saveEntries) }
     ).catch(() => {});
   }
 }
