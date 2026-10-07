@@ -923,7 +923,9 @@ async function renderChannelPicker(ctx) {
   const n = state.selected.size;
   rows.push([Markup.button.callback(`▶️ Continue (${n} selected)`, 'pch_continue')]);
   rows.push([Markup.button.callback('❌ Cancel', 'pch_cancel')]);
-  const heading = state.mode === 'topic_post'
+  const heading = state.mode === 'topic_thumb_post'
+    ? '🖼️ THUMBNAIL + TITLE POST\n\nযে Channel(গুলো)-তে Post করবেন সিলেক্ট করুন:'
+    : state.mode === 'topic_post'
     ? '📤 SELECT CHANNEL(S)\n\nএক বা একাধিক Channel সিলেক্ট করুন:'
     : '➕ CREATE NEW POST\n\nএক বা একাধিক Channel সিলেক্ট করুন:';
   return ctx.editMessageText(heading, Markup.inlineKeyboard(rows)).catch(() => ctx.reply(heading, Markup.inlineKeyboard(rows)));
@@ -974,6 +976,30 @@ bot.action('pch_continue', async ctx => {
         [Markup.button.callback('❌ Cancel', 'post_cancel')]
       ])
     );
+  }
+
+  if (state.mode === 'topic_thumb_post') {
+    // Thumbnail + Title only (NO video). Opens the normal Post Now / Schedule
+    // screen, so post_confirm / post_schedule do the real work.
+    const topicId = state.topicId;
+    delete channelPickData[ctx.from.id];
+    const td = await db.collection('topics').doc(topicId).get();
+    if (!td.exists) return ctx.reply('❌ Video/Topic পাওয়া যায়নি।');
+    const t = td.data();
+    if (!t.thumbnail) return ctx.reply('❌ এই Video-র Thumbnail নেই। আগে Thumbnail সেট করুন।');
+    const title = t.title || 'নামবিহীন ভিডিও';
+    postData[ctx.from.id] = {
+      step: 'confirm', type: 'photo', fileId: t.thumbnail, topicId,
+      title, caption: t.title || '', captionEntities: [], channels: resolved
+    };
+    return ctx.replyWithPhoto(t.thumbnail, {
+      caption: `👀 Post Preview\n\n📌 Title: ${title}\n🆔 Topic ID: ${topicId}\n📢 Channel: ${resolved.length}টি\n\nশুধু Thumbnail + Title Post হবে (ভিডিও যাবে না)।\nএখনই Post করুন, অথবা Schedule করুন।`,
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Post Now', 'post_confirm')],
+        [Markup.button.callback('🕒 Schedule করুন', 'post_schedule')],
+        [Markup.button.callback('❌ Cancel', 'post_cancel')]
+      ]).reply_markup
+    });
   }
 
   if (state.mode === 'topic_post') {
@@ -1749,12 +1775,15 @@ bot.action('gp_confirm', async (ctx) => {
 
   const keyboard = state.buttonRows.length ? Markup.inlineKeyboard(state.buttonRows) : null;
   const lines = [];
+  const saveEntries = [];
+  const gpCaption = state.caption || '';
 
   for (const channel of postingChannels) {
     try {
       if (state.media.length === 0) {
         // Text-only post.
         const sent = await bot.telegram.sendMessage(channel, state.caption || '\u200B', { ...(state.caption ? textEntitiesExtra(state.captionEntities) : {}), ...(keyboard ? { reply_markup: keyboard.reply_markup } : {}) });
+        saveEntries.push({ channelId: channel, messageId: sent.message_id, type: 'text', caption: gpCaption, title: '', topicId: '' });
         lines.push(`✅ ${channel} — Message ID: ${sent.message_id}`);
       } else if (state.media.length === 1) {
         // Single item CAN carry the button directly.
@@ -1763,6 +1792,7 @@ bot.action('gp_confirm', async (ctx) => {
         const sent = m.type === 'video'
           ? await bot.telegram.sendVideo(channel, m.fileId, opts)
           : await bot.telegram.sendPhoto(channel, m.fileId, opts);
+        saveEntries.push({ channelId: channel, messageId: sent.message_id, type: m.type, caption: gpCaption, title: '', topicId: '' });
         lines.push(`✅ ${channel} — Message ID: ${sent.message_id}`);
       } else {
         // Telegram albums (sendMediaGroup) cannot carry an inline keyboard.
@@ -1791,7 +1821,7 @@ bot.action('gp_confirm', async (ctx) => {
   delete postData[userId];
   return ctx.reply(
     `📤 সাধারণ Post সম্পন্ন হয়েছে (${postingChannels.length}টি Channel):\n\n` + escapeHtml(lines.join('\n')),
-    { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup }
+    { parse_mode: 'HTML', reply_markup: postDoneMarkup(saveEntries) }
   );
 });
 
@@ -1952,13 +1982,52 @@ function registerPendingSave(entries) {
   return token;
 }
 
+const SAVE_TYPE_CHAR = { photo: 'p', video: 'v', text: 't', animation: 'a' };
+const SAVE_CHAR_TYPE = { p: 'photo', v: 'video', t: 'text', a: 'animation' };
+
 function postDoneMarkup(entries, label) {
   const rows = [];
-  const token = registerPendingSave(entries);
-  if (token) rows.push([Markup.button.callback(label || '💾 Repost List-এ Save করুন', 'rsave:' + token)]);
+  const list = (entries || []).filter(e => e && e.channelId && e.messageId);
+  if (!list.length) console.warn('⚠️ postDoneMarkup: no successful post, so no Save button.');
+  // Stateless buttons: everything needed is inside the callback data, so Save
+  // still works after the server restarted / went to sleep (the old in-memory
+  // token was lost on restart — typical for scheduled posts).
+  const direct = list.map(e => {
+    const data = `rs1:${e.channelId}:${e.messageId}:${SAVE_TYPE_CHAR[e.type] || 'v'}:${e.topicId || ''}`;
+    return Buffer.byteLength(data, 'utf8') <= 64 ? { e, data } : null;
+  });
+  if (list.length && direct.every(Boolean) && list.every(e => e.topicId)) { // no topic => keep caption via in-memory token
+    direct.forEach(({ e, data }) => {
+      const text = list.length === 1 ? (label || '💾 Repost List-এ Save করুন') : `💾 Save — ${safeTruncate(e.channelId, 20)}`;
+      rows.push([Markup.button.callback(text, data)]);
+    });
+  } else {
+    const token = registerPendingSave(list);
+    if (token) rows.push([Markup.button.callback(label || '💾 Repost List-এ Save করুন', 'rsave:' + token)]);
+  }
   rows.push([Markup.button.callback('🏠 Admin Panel', 'adm_home')]);
   return Markup.inlineKeyboard(rows).reply_markup;
 }
+
+bot.action(/^rs1:([^:]+):(\d+):([pvta]):(.*)$/, async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const [, channelId, messageId, typeChar, topicId] = ctx.match;
+  try {
+    const r = await saveRepostEntries([{ channelId, messageId: Number(messageId), type: SAVE_CHAR_TYPE[typeChar] || 'video', caption: '', title: '', topicId }]);
+    let msg = r.saved ? '✅ Repost List-এ Save হয়েছে' : (r.duplicates ? 'ℹ️ আগে থেকেই List-এ আছে' : '⚠️ Save হয়নি');
+    if (r.full) msg += ' (List full — পুরোনো কিছু Delete করুন)';
+    await ctx.answerCbQuery(msg, { show_alert: !!r.full });
+    // Remove only the tapped Save button, keep other channels' buttons.
+    const kb = ctx.callbackQuery && ctx.callbackQuery.message && ctx.callbackQuery.message.reply_markup;
+    const left = kb && Array.isArray(kb.inline_keyboard)
+      ? kb.inline_keyboard.filter(row => !row.some(b => b.callback_data === ctx.callbackQuery.data))
+      : [[Markup.button.callback('🏠 Admin Panel', 'adm_home')]];
+    await ctx.editMessageReplyMarkup({ inline_keyboard: left }).catch(() => {});
+  } catch (e) {
+    console.error('❌ rs1 save error:', e.message);
+    return ctx.answerCbQuery('❌ Save করা যায়নি, আবার চেষ্টা করুন');
+  }
+});
 
 bot.action(/^rsave:([a-f0-9]+)$/, async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
@@ -2564,6 +2633,7 @@ bot.action(/^aview:(.+)$/, async ctx=>{
   return ctx.editMessageText(`🎬 VIDEO DETAILS\n\n📌 ${escapeHtml(t.title||'নামবিহীন')}\n🆔 <code>${escapeHtml(id)}</code>\n📹 Videos: ${t.videoCount||0}\n🎯 Ads: ${t.adsRequired||1}\n👁️ Views: ${Number(t.unlockCount||0)}`,{ parse_mode: 'HTML', ...Markup.inlineKeyboard([
     [Markup.button.callback('✏️ Rename','av_rename:'+id),Markup.button.callback('🖼️ Thumbnail','av_thumb:'+id)],
     [Markup.button.callback('🎯 Ads','av_ads:'+id),Markup.button.callback('📤 Post','apost_topic:'+id)],
+    [Markup.button.callback('🖼️ Thumbnail + Title Post','apost_thumb:'+id)],
     [Markup.button.callback('📼 Video যুক্ত করুন','av_append:'+id),Markup.button.callback('🧬 Duplicate','av_duplicate:'+id)],
     [Markup.button.callback('🗑️ Delete','av_delete:'+id)],
     [Markup.button.callback('⬅️ Back','adm_list')]
@@ -2611,6 +2681,16 @@ bot.action(/^av_delete_confirm:(.+)$/, async ctx=>{
   invalidateTopicsCache();
   await ctx.answerCbQuery('Deleted');
   return ctx.editMessageText('✅ Video/Topic delete হয়েছে।', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'adm_list')]]));
+});
+bot.action(/^apost_thumb:(.+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌');
+  const topicId = ctx.match[1];
+  const td = await db.collection('topics').doc(topicId).get();
+  if (!td.exists) return ctx.answerCbQuery('❌ Video পাওয়া যায়নি');
+  if (!td.data().thumbnail) return ctx.answerCbQuery('❌ Thumbnail নেই', { show_alert: true });
+  channelPickData[ctx.from.id] = { mode: 'topic_thumb_post', topicId, selected: new Set() };
+  await ctx.answerCbQuery();
+  return renderChannelPicker(ctx);
 });
 bot.action(/^apost_topic:(.+)$/, async ctx=>{ if(!adminOnly(ctx))return ctx.answerCbQuery('❌'); const topicId=ctx.match[1]; channelPickData[ctx.from.id]={mode:'topic_post',topicId,selected:new Set()}; await ctx.answerCbQuery(); return renderChannelPicker(ctx); });
 bot.action(/^vipdays:(\d+|custom)$/, async ctx => {
@@ -2688,7 +2768,7 @@ function renderRepostPage(ctx, userId, page, fresh = false) {
   const rows = slice.map((p, i) => {
     const globalIndex = start + i;
     const caption = String(p.caption || p.title || '(Caption নেই)').replace(/\s+/g, ' ').trim();
-    const media = p.type === 'photo' ? '🖼️' : '🎬';
+    const media = p.type === 'photo' ? '🖼️' : (p.type === 'text' ? '📝' : '🎬');
     const date = p.savedAt ? new Date(Number(p.savedAt)).toLocaleDateString('en-GB') : '';
     const label = `${state.deleteMode ? '🗑' : media} ${safeTruncate(caption, 46)}${date ? ` • ${date}` : ''}`;
     return [Markup.button.callback(label, state.deleteMode ? `repost_del:${p.messageId}` : `repost_post:${globalIndex}`)];
@@ -4178,7 +4258,10 @@ async function saveTopic(ctx, data) {
       createdAt: new Date().toISOString()
     });
     invalidateTopicsCache();
-    await ctx.reply(`✅ টপিক "${data.title}" তৈরি হয়েছে!\n📹 ভিডিও সংখ্যা: ${data.videos.length}\n🔢 অ্যাড প্রয়োজন: ${data.adsRequired}\n🆔 টপিক আইডি: <code>${topicRef.id}</code>`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup });
+    await ctx.reply(`✅ টপিক "${data.title}" তৈরি হয়েছে!\n📹 ভিডিও সংখ্যা: ${data.videos.length}\n🔢 অ্যাড প্রয়োজন: ${data.adsRequired}\n🆔 টপিক আইডি: <code>${topicRef.id}</code>\n\n📢 এখন Post করবেন কি? (Post Now বা Schedule — শুধু Thumbnail + Title যাবে, ভিডিও যাবে না)`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
+      [Markup.button.callback('📢 Post করুন (Thumbnail + Title)', 'apost_thumb:' + topicRef.id)],
+      [Markup.button.callback('❌ না, এখন না', 'adm_home')]
+    ]).reply_markup });
   } catch (error) {
     console.error('Error saving topic:', error);
     await ctx.reply('❌ টপিক সেভ করতে সমস্যা হয়েছে।');
@@ -4201,7 +4284,10 @@ async function saveVideo(ctx, data) {
       createdAt: new Date().toISOString()
     });
     invalidateTopicsCache();
-    await ctx.reply(`✅ ভিডিও "${data.title}" যোগ হয়েছে!\n🆔 টপিক আইডি: <code>${topicRef.id}</code>`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup });
+    await ctx.reply(`✅ ভিডিও "${data.title}" যোগ হয়েছে!\n🆔 টপিক আইডি: <code>${topicRef.id}</code>\n\n📢 এখন Post করবেন কি? (Post Now বা Schedule — শুধু Thumbnail + Title যাবে, ভিডিও যাবে না)`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
+      [Markup.button.callback('📢 Post করুন (Thumbnail + Title)', 'apost_thumb:' + topicRef.id)],
+      [Markup.button.callback('❌ না, এখন না', 'adm_home')]
+    ]).reply_markup });
   } catch (error) {
     console.error('Error saving video:', error);
     await ctx.reply('❌ ভিডিও সেভ করতে সমস্যা হয়েছে।');
