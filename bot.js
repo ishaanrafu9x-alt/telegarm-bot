@@ -50,6 +50,15 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
+// Admin reply-keyboard buttons are routed through synthetic callback queries
+// (id starts with 'kb_'). Telegram has no such query, so answerCbQuery is a no-op.
+bot.use(async (ctx, next) => {
+  if (ctx.callbackQuery && String(ctx.callbackQuery.id).startsWith('kb_')) {
+    ctx.answerCbQuery = async () => true;
+  }
+  return next();
+});
+
 // ✅ .env থেকে Firebase JSON ব্যবহার করুন
 const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 
@@ -1079,6 +1088,48 @@ async function sendAdminPanel(ctx, edit = false) {
   return ctx.reply(text, keyboard);
 }
 
+// ⌨️ ADMIN-ONLY fixed reply keyboard (always visible under the message box).
+// Normal users never receive it, so their experience is unchanged.
+const ADMIN_KB_BUTTONS = [
+  ['📊 Dashboard', 'dashboard'], ['🎬 Videos', 'videos'],
+  ['📢 Channels', 'channels'], ['📤 Create Post', 'create_post'],
+  ['👥 Users', 'users'], ['📺 Ads', 'ads'],
+  ['📣 Broadcast', 'broadcast'], ['🔘 Post Buttons', 'buttons'],
+  ['💰 Revenue', 'revenue'], ['📦 Export Data', 'export'],
+  ['🕒 Scheduled Posts', 'scheduled'], ['👑 VIP Subscription', 'vip'],
+  ['🏠 Admin Panel', 'home']
+];
+function adminReplyKeyboard() {
+  const rows = [];
+  for (let i = 0; i < ADMIN_KB_BUTTONS.length; i += 2) {
+    rows.push(ADMIN_KB_BUTTONS.slice(i, i + 2).map(b => b[0]));
+  }
+  return Markup.keyboard(rows).resize().persistent();
+}
+async function sendAdminKeyboard(ctx) {
+  return ctx.reply('⌨️ Admin Keyboard চালু আছে। নিচের বাটন থেকে যেকোনো অপশন বেছে নিন।', adminReplyKeyboard());
+}
+for (const [label, action] of ADMIN_KB_BUTTONS) {
+  bot.hears(label, async (ctx, next) => {
+    if (!adminOnly(ctx) || ctx.chat.type !== 'private') return next();
+    try {
+      const placeholder = await ctx.reply('⏳ ' + label);
+      await bot.handleUpdate({
+        update_id: Date.now(),
+        callback_query: {
+          id: 'kb_' + Date.now(),
+          from: ctx.from,
+          message: placeholder,
+          chat_instance: 'admin_kb',
+          data: 'adm_' + action
+        }
+      });
+    } catch (e) {
+      console.error('❌ Admin keyboard error:', e.message);
+    }
+  });
+}
+
 
 function escapeHtml(text) {
   return String(text ?? '')
@@ -1280,6 +1331,11 @@ bot.start(async (ctx) => {
     // Mark that this user has started the bot at least once.
     // Existing users can receive unlocked videos directly without another /start.
     await updateUser(userId, { botStarted: true });
+
+    // Admin gets the fixed admin keyboard on /start (normal users do not).
+    if (userId === ADMIN_ID && ctx.chat && ctx.chat.type === 'private' && !String(ctx.startPayload || '').trim()) {
+      await sendAdminKeyboard(ctx);
+    }
 
     // /start no longer forces channel join/verification.
     // If this user unlocked a topic in the Mini App before starting the bot,
@@ -2351,6 +2407,7 @@ async function getUserCountsCached() {
 bot.command('admin', async (ctx) => {
   try {
     if (!adminOnly(ctx)) return ctx.reply('⛔ এই কমান্ড শুধুমাত্র অ্যাডমিনের জন্য।');
+    await sendAdminKeyboard(ctx);
     return sendAdminPanel(ctx);
   } catch (error) {
     console.error('❌ Error in /admin:', error);
