@@ -4681,9 +4681,10 @@ async function deliverUnlockedTopicInner(userId, topicId, userStateHint) {
 // restart just resets it to `0` (→ starts again at Monetag), which is
 // completely harmless for a rotation.
 let adNetworkRotationCounter = 0;
+const AD_NETWORKS = ['adsgram', 'monetag', 'onclicka']; // rotation order
 function nextAdNetwork() {
   const current = adNetworkRotationCounter++;
-  return (current % 2 === 0) ? 'monetag' : 'onclicka';
+  return AD_NETWORKS[current % AD_NETWORKS.length];
 }
 
 app.post('/api/ad-start', async (req, res) => {

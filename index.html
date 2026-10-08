@@ -9,6 +9,7 @@
 <link rel="preconnect" href="https://api.telegram.org" crossorigin>
 <script src="//libtl.com/sdk.js" data-zone="11737734" data-sdk="show_11737734" async></script>
 <script src="https://js.onclckvd.com/in-stream-ad-admanager/tma.js" async></script>
+<script src="https://sad.adsgram.ai/js/sad.min.js" async></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -645,10 +646,26 @@ initOnclicka().then(function(){
 }).catch(function(e){
   console.warn('🔴 [AD-DEBUG] OnClickA init FAILED at page load (will retry when an ad is actually needed):',e);
 });
+// Rotation order — keep in sync with AD_NETWORKS in worker.js and bot.js.
+var AD_NETWORKS=['adsgram','monetag','onclicka'];
+var ADSGRAM_BLOCK_ID='int-52585';
+var adsgramController=null;
+function getAdsgram(){
+  if(adsgramController) return adsgramController;
+  if(!window.Adsgram || typeof window.Adsgram.init!=='function') return null;
+  adsgramController=window.Adsgram.init({blockId:ADSGRAM_BLOCK_ID});
+  return adsgramController;
+}
 function pickAdNetwork(){
-  return (adCount%2===0)?'monetag':'onclicka';
+  return AD_NETWORKS[adCount%AD_NETWORKS.length];
 }
 function showNetworkAd(network){
+  if(network==='adsgram'){
+    var ag=getAdsgram();
+    if(!ag) return Promise.reject(new Error('Adsgram not ready'));
+    console.log('🟡 [AD-DEBUG] Calling Adsgram show()...');
+    return ag.show(); // resolves {done:true,...}; rejects {error:true,done:false,description} on skip/no-fill
+  }
   if(network==='onclicka'){
     if(typeof onclickaShowFn==='function'){
       console.log('🟡 [AD-DEBUG] Calling OnClickA show() (SDK was already initialized)...');
@@ -713,7 +730,7 @@ function startAds(topic,button){
     // rotation would pick Monetag every single time. pickAdNetwork() below
     // is kept only as a defensive fallback in case an old server response
     // (or a network hiccup) doesn't include `network`.
-    var myNetwork=startData.network||pickAdNetwork();
+    var myNetwork=(AD_NETWORKS.indexOf(startData.network)>=0)?startData.network:pickAdNetwork();
     console.log('🎯 [AD-DEBUG] This attempt will try: '+myNetwork+' (server said: '+(startData.network||'nothing, used client fallback')+')');
 
     var overlay=document.getElementById('ad-overlay');
@@ -751,33 +768,31 @@ function startAds(topic,button){
       },wait);
     }
 
-    var network=myNetwork;
-    try{
-      showNetworkAd(network).then(function(result){
-        console.log('✅ [AD-DEBUG] '+network+' show() SUCCEEDED — this ad was actually served by '+network+'.');
+    // Try the server-chosen network first; if it fails (no fill, skipped,
+    // SDK not loaded) silently try the remaining networks in order. Only
+    // when ALL fail do we show the error. Any successful network counts as
+    // one normal ad-progress step — the server doesn't care which one served it.
+    var chain=[myNetwork].concat(AD_NETWORKS.filter(function(n){return n!==myNetwork}));
+    function attempt(i){
+      var network=chain[i];
+      var p;
+      try{p=showNetworkAd(network);}catch(err){p=Promise.reject(err);}
+      p.then(function(result){
+        console.log('✅ [AD-DEBUG] '+network+' show() SUCCEEDED.');
         handleResult(result);
-      }).catch(function(e){
-        console.warn('🔴 [AD-DEBUG] '+network+' show() FAILED/REJECTED — falling back to the other network. Reason:',e);
+      },function(e){
+        console.warn('🔴 [AD-DEBUG] '+network+' show() FAILED/REJECTED. Reason:',e);
         if(myToken!==currentAdToken) return;
-        // One network being down/out of fill (e.g. OnClickA's own daily
-        // per-user cap kicking in and its Promise rejecting) shouldn't block
-        // unlocking — silently retry with the other network instead. The
-        // user never sees an error or a broken button either way; this
-        // fallback attempt still counts as one normal ad-progress step,
-        // since recordAd()/`/api/ad-complete` below don't know or care which
-        // network actually served the ad.
-        var fallback=network==='onclicka'?'monetag':'onclicka';
-        console.log('🎯 [AD-DEBUG] Fallback attempt will try: '+fallback);
-        showNetworkAd(fallback).then(function(result){
-          console.log('✅ [AD-DEBUG] Fallback '+fallback+' show() SUCCEEDED.');
-          handleResult(result);
-        }).catch(function(e2){
-          console.error('🔴 [AD-DEBUG] Fallback '+fallback+' ALSO FAILED:',e2);
-          if(myToken!==currentAdToken) return;
-          resetAd('⚠️ এই মুহূর্তে কোনো Ad পাওয়া যায়নি। একটু পর আবার চেষ্টা করুন।');
-        });
+        if(i+1<chain.length){
+          console.log('🎯 [AD-DEBUG] Fallback attempt will try: '+chain[i+1]);
+          attempt(i+1);
+          return;
+        }
+        console.error('🔴 [AD-DEBUG] All ad networks failed.');
+        resetAd('⚠️ এই মুহূর্তে কোনো Ad পাওয়া যায়নি। একটু পর আবার চেষ্টা করুন।');
       });
-    }catch(e){console.error(e);resetAd('⚠️ এই মুহূর্তে কোনো Ad পাওয়া যায়নি। একটু পর আবার চেষ্টা করুন।')}
+    }
+    attempt(0);
   }).catch(function(e){console.error(e);resetAd('Ad শুরু করা যায়নি')});
 }
 
