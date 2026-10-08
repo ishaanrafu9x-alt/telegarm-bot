@@ -287,6 +287,16 @@ let adminUserPage = 0;
 const CHANNELS_CACHE_TTL = 5 * 60 * 1000;
 let channelsCache = null;
 let channelsCacheAt = 0;
+// Channel IDs the admin deleted on purpose (mostly the legacy POST_CHANNEL env
+// channel, which would otherwise be re-injected on every getChannels() call).
+let deletedChannelSet = new Set();
+function channelTombKey(channelId) {
+  return String(channelId || '').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+async function isChannelDeleted(channelId) {
+  await getChannels();
+  return deletedChannelSet.has(String(channelId || '').trim());
+}
 function invalidateChannelsCache() {
   channelsCache = null;
   channelsCacheAt = 0;
@@ -868,6 +878,16 @@ async function getChannels() {
   const result = [];
   const seen = new Set();
 
+  // Load channels the admin deleted on purpose.
+  const deleted = new Set();
+  try {
+    const delSnap = await db.collection('deletedChannels').get();
+    delSnap.forEach(d => { const id = String((d.data() || {}).channelId || '').trim(); if (id) deleted.add(id); });
+  } catch (e) {
+    console.error('❌ Deleted channels read error:', e.message);
+  }
+  deletedChannelSet = deleted;
+
   try {
     const chSnap = await db.collection('channels').orderBy('createdAt', 'asc').get();
     for (const d of chSnap.docs) {
@@ -884,7 +904,7 @@ async function getChannels() {
   // Keep old POST_CHANNEL working and show it in Admin > Channels too.
   if (POST_CHANNEL) {
     const key = String(POST_CHANNEL).trim();
-    if (!seen.has(key)) {
+    if (!seen.has(key) && !deleted.has(key)) {
       const envId = `env_${key.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
       const override = result.find(c => c.legacyOverride && String(c.channelId||'').trim() === key) || null;
       result.unshift(override ? { id: envId, ...override, legacy: true } : {
@@ -916,7 +936,7 @@ async function renderChannelPicker(ctx) {
     const checked = state.selected.has(key) ? '✅' : '⬜';
     return [Markup.button.callback(`${checked} ${safeTruncate(c.name || c.channelId, 35)}`, 'pch_toggle:' + key)];
   });
-  if (!rows.length && POST_CHANNEL) {
+  if (!rows.length && POST_CHANNEL && !deletedChannelSet.has(String(POST_CHANNEL).trim())) {
     const checked = state.selected.has(POST_CHANNEL) ? '✅' : '⬜';
     rows.push([Markup.button.callback(`${checked} Posting Channel`, 'pch_toggle:' + POST_CHANNEL)]);
   }
@@ -1030,6 +1050,8 @@ bot.action('pch_continue', async ctx => {
 });
 
 async function addChannelRecord(data) {
+  // Re-adding a previously deleted channel un-deletes it.
+  try { await db.collection('deletedChannels').doc(channelTombKey(data.channelId)).delete(); } catch (e) {}
   const ref = await db.collection('channels').add({
     name: data.name, channelId: data.channelId, link: data.link || '', active: true, createdAt: Date.now(), updatedAt: Date.now()
   });
@@ -1650,8 +1672,8 @@ bot.command('setlink', async (ctx) => {
 
 bot.command('post', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.reply('⛔ এই কমান্ড শুধুমাত্র অ্যাডমিনের জন্য।');
-  if (!POST_CHANNEL) {
-    return ctx.reply('❌ POST_CHANNEL সেট করা নেই। Render Environment Variables-এ POST_CHANNEL দিন।');
+  if (!POST_CHANNEL || await isChannelDeleted(POST_CHANNEL)) {
+    return ctx.reply('❌ Posting Channel সেট করা নেই। Admin Panel > Channels থেকে Channel add করুন।');
   }
 
   // Explicit /post switches to posting mode and clears Add Video/Topic.
@@ -3006,6 +3028,11 @@ bot.action(/^ach_del_confirm:(.+)$/, async ctx=>{
   const channelIdToClean = c ? String(c.channelId) : String(id);
 
   try { await db.collection('channels').doc(id).delete(); } catch (e) { console.error('❌ Channel delete error:', e.message); }
+
+  // Remember the deletion so the legacy POST_CHANNEL env channel is not re-added.
+  try {
+    await db.collection('deletedChannels').doc(channelTombKey(channelIdToClean)).set({ channelId: channelIdToClean, deletedAt: Date.now() });
+  } catch (e) { console.error('❌ Channel tombstone error:', e.message); }
   invalidateChannelsCache();
 
   // Clean up this channel's saved Repost list (single doc).
