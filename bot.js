@@ -1080,7 +1080,8 @@ async function sendAdminPanel(ctx, edit = false) {
     [Markup.button.callback('📣 Broadcast', 'adm_broadcast'), Markup.button.callback('🔘 Post Buttons', 'adm_buttons')],
     [Markup.button.callback('💰 Revenue', 'adm_revenue'), Markup.button.callback('📦 Export Data', 'adm_export')],
     [Markup.button.callback('🕒 Scheduled Posts', 'adm_scheduled')],
-    [Markup.button.callback('👑 VIP Subscription', 'adm_vip')]
+    [Markup.button.callback('👑 VIP Subscription', 'adm_vip')],
+    [Markup.button.callback('⌨️ Keyboard Show', 'adm_kb_show'), Markup.button.callback('❌ Keyboard Hide', 'adm_kb_hide')]
   ]);
   if (edit && ctx.callbackQuery?.message) {
     return ctx.editMessageText(text, keyboard).catch(() => ctx.reply(text, keyboard));
@@ -1097,18 +1098,43 @@ const ADMIN_KB_BUTTONS = [
   ['📣 Broadcast', 'broadcast'], ['🔘 Post Buttons', 'buttons'],
   ['💰 Revenue', 'revenue'], ['📦 Export Data', 'export'],
   ['🕒 Scheduled Posts', 'scheduled'], ['👑 VIP Subscription', 'vip'],
-  ['🏠 Admin Panel', 'home']
+  ['🏠 Admin Panel', 'home'], ['❌ Keyboard Hide', 'kb_hide']
 ];
 function adminReplyKeyboard() {
   const rows = [];
   for (let i = 0; i < ADMIN_KB_BUTTONS.length; i += 2) {
     rows.push(ADMIN_KB_BUTTONS.slice(i, i + 2).map(b => b[0]));
   }
-  return Markup.keyboard(rows).resize().persistent();
+  // oneTime + NOT persistent: after a tap the keyboard collapses by itself and
+  // stays reachable through the keyboard icon in the message box.
+  return Markup.keyboard(rows).resize().oneTime();
 }
 async function sendAdminKeyboard(ctx) {
-  return ctx.reply('⌨️ Admin Keyboard চালু আছে। নিচের বাটন থেকে যেকোনো অপশন বেছে নিন।', adminReplyKeyboard());
+  return ctx.reply('⌨️ Admin Keyboard সেট হয়েছে। বাটন চাপলে keyboard নিজে বন্ধ হয়ে যাবে, আবার দেখতে message box-এর keyboard icon-এ চাপুন।', adminReplyKeyboard());
 }
+async function hideAdminKeyboard(ctx) {
+  return ctx.reply('✅ Admin Keyboard বন্ধ করা হয়েছে। আবার চালু করতে /keyboard লিখুন বা Admin Panel > Keyboard Show চাপুন।', Markup.removeKeyboard());
+}
+// The keyboard is OFF by default. The admin turns it on / off only when wanted.
+bot.command('keyboard', async (ctx) => {
+  if (!adminOnly(ctx)) return;
+  return sendAdminKeyboard(ctx);
+});
+bot.command('hidekeyboard', async (ctx) => {
+  if (!adminOnly(ctx)) return;
+  return hideAdminKeyboard(ctx);
+});
+bot.action('adm_kb_show', async (ctx) => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌');
+  await ctx.answerCbQuery().catch(() => {});
+  return sendAdminKeyboard(ctx);
+});
+bot.action('adm_kb_hide', async (ctx) => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌');
+  await ctx.answerCbQuery().catch(() => {});
+  if (String(ctx.callbackQuery.id).startsWith('kb_')) await ctx.deleteMessage().catch(() => {});
+  return hideAdminKeyboard(ctx);
+});
 for (const [label, action] of ADMIN_KB_BUTTONS) {
   bot.hears(label, async (ctx, next) => {
     if (!adminOnly(ctx) || ctx.chat.type !== 'private') return next();
@@ -1331,11 +1357,6 @@ bot.start(async (ctx) => {
     // Mark that this user has started the bot at least once.
     // Existing users can receive unlocked videos directly without another /start.
     await updateUser(userId, { botStarted: true });
-
-    // Admin gets the fixed admin keyboard on /start (normal users do not).
-    if (userId === ADMIN_ID && ctx.chat && ctx.chat.type === 'private' && !String(ctx.startPayload || '').trim()) {
-      await sendAdminKeyboard(ctx);
-    }
 
     // /start no longer forces channel join/verification.
     // If this user unlocked a topic in the Mini App before starting the bot,
@@ -2407,7 +2428,6 @@ async function getUserCountsCached() {
 bot.command('admin', async (ctx) => {
   try {
     if (!adminOnly(ctx)) return ctx.reply('⛔ এই কমান্ড শুধুমাত্র অ্যাডমিনের জন্য।');
-    await sendAdminKeyboard(ctx);
     return sendAdminPanel(ctx);
   } catch (error) {
     console.error('❌ Error in /admin:', error);
