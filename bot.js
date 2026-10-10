@@ -550,6 +550,33 @@ function recordUnlock(topicId) {
   if (pendingUnlockStats.size >= 50) flushUnlockStats().catch(() => {});
 }
 
+// Views shown on the cards come from the in-memory topics cache (1h TTL) and the
+// compact `system/topicsIndex` doc that the Cloudflare Worker reads. Neither was
+// updated when unlocks were flushed, so "Views" stayed frozen. Patch the caches
+// right after a successful flush and re-publish the index (max once / 3 min).
+let topicsIndexDirty = false;
+function applyUnlockToCaches(topicId, count, lastTs) {
+  const todayKey = getDhakaDateKey(new Date(lastTs));
+  if (Array.isArray(topicsCache)) {
+    const t = topicsCache.find(x => String(x.id) === String(topicId));
+    if (t) {
+      t.dailyUnlockCount = (t.dailyUnlockDate === todayKey ? (Number(t.dailyUnlockCount) || 0) : 0) + count;
+      t.dailyUnlockDate = todayKey;
+      t.unlockCount = (Number(t.unlockCount) || 0) + count;
+      t.lastUnlockAt = lastTs;
+    }
+  }
+  const single = singleTopicCache.get(String(topicId));
+  if (single && single.data) single.data.unlockCount = (Number(single.data.unlockCount) || 0) + count;
+  topicsIndexDirty = true;
+}
+const topicsIndexViewsTimer = setInterval(() => {
+  if (!topicsIndexDirty) return;
+  topicsIndexDirty = false;
+  rebuildTopicsIndex().catch(e => { topicsIndexDirty = true; console.error('❌ topicsIndex views refresh error:', e.message); });
+}, 3 * 60 * 1000);
+if (typeof topicsIndexViewsTimer.unref === 'function') topicsIndexViewsTimer.unref();
+
 async function flushUnlockStats() {
   if (!pendingUnlockStats.size || unlockStatsFlushPromise) return unlockStatsFlushPromise;
   const batch = pendingUnlockStats;
@@ -580,6 +607,7 @@ async function flushUnlockStats() {
             dailyUnlockCount
           }, { merge: true });
         });
+        applyUnlockToCaches(topicId, entry.count, entry.timestamps[entry.timestamps.length - 1]);
       } catch (e) {
         // Put this topic's counts back for the next flush instead of losing them.
         const back = pendingUnlockStats.get(topicId) || { count: 0, timestamps: [] };
@@ -2623,6 +2651,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
     );
   }
   if (action === 'analytics' || action === 'dashboard') {
+    try { await Promise.all([flushAdViews(), flushUnlockStats()]); } catch (_) {}
     const counts = await getUserCountsCached(); const topics = await getTopicsCached();
     const totalViews = topics.reduce((n,t)=>n+(Number(t.unlockCount)||0),0); const today=getDhakaDateKey(); const todayViews=topics.reduce((n,t)=>n+(t.dailyUnlockDate===today?(Number(t.dailyUnlockCount)||0):0),0);
     return ctx.editMessageText(`📊 ${action==='dashboard'?'DASHBOARD':'ANALYTICS'}\n\n👥 Users: ${counts.totalUsers}\n🎬 Videos/Topics: ${topics.length}\n👁️ Total Views: ${totalViews.toLocaleString('en-US')}\n📅 Today: ${todayViews.toLocaleString('en-US')}`, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back','adm_home')]]));
@@ -2634,6 +2663,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   if (action === 'set_ads') { updateAdsData[ctx.from.id]={step:'topicId'}; return ctx.reply('🎯 Video/Topic ID পাঠান:'); }
   if (action === 'daily_limit') { const current=await getDailyAdLimit(); updateAdsData[ctx.from.id]={step:'dailyLimit'}; return ctx.reply(`📊 বর্তমান Daily Ad Limit: ${current}টি\n\nনতুন limit লিখুন:`); }
   if (action === 'revenue') {
+    try { await Promise.all([flushAdViews(), flushUnlockStats()]); } catch (_) {}
     const [stats, cpm] = await Promise.all([getAdStats(), getAdCpm()]);
     const estTotalRevenue = (stats.totalAdViews / 1000) * cpm;
     const estTodayRevenue = (stats.todayAdViews / 1000) * cpm;
@@ -5917,8 +5947,8 @@ async function gracefulExit(signal) {
   // Persist non-critical analytics before exit, without delaying delivery
   // shutdown indefinitely.
   try { await Promise.race([
-    flushAdViews(),
-    new Promise(resolve => setTimeout(resolve, 1500))
+    Promise.all([flushAdViews(), flushUnlockStats()]),
+    new Promise(resolve => setTimeout(resolve, 3000))
   ]); } catch (_) {}
   process.exit(0);
 }
