@@ -1050,7 +1050,8 @@ bot.action('pch_continue', async ctx => {
       title, caption: t.title || '', captionEntities: [], channels: resolved
     };
     return ctx.replyWithPhoto(t.thumbnail, {
-      caption: `👀 Post Preview\n\n📌 Title: ${title}\n🆔 Topic ID: ${topicId}\n📢 Channel: ${resolved.length}টি\n\nশুধু Thumbnail + Title Post হবে (ভিডিও যাবে না)।\nএখনই Post করুন, অথবা Schedule করুন।`,
+      parse_mode: 'HTML',
+      caption: `👀 Post Preview\n\n📌 Title: <code>${escapeHtml(title)}</code>\n🆔 Topic ID: <code>${escapeHtml(topicId)}</code>\n📢 Channel: ${resolved.length}টি\n\nশুধু Thumbnail + Title Post হবে (ভিডিও যাবে না)।\nএখনই Post করুন, অথবা Schedule করুন।`,
       reply_markup: Markup.inlineKeyboard([
         [Markup.button.callback('✅ Post Now', 'post_confirm')],
         [Markup.button.callback('🕒 Schedule করুন', 'post_schedule')],
@@ -1552,7 +1553,7 @@ bot.on('video', async (ctx) => {
       const result = await appendVideoToTopic(appendVideoData[userId].topicId, storedFileId);
       delete appendVideoData[userId];
       if (!result) return ctx.reply('❌ Topic আর পাওয়া যাচ্ছে না।');
-      return ctx.reply(`✅ ভিডিও যুক্ত হয়েছে!\n\n📌 ${escapeHtml(result.title)}\n📹 এখন মোট ভিডিও: ${result.videoCount}\n🆔 <code>${escapeHtml(result.id)}</code>`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🎬 Topic দেখুন', 'aview:' + result.id)], [Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup });
+      return ctx.reply(`✅ ভিডিও যুক্ত হয়েছে!\n\n📌 <code>${escapeHtml(result.title)}</code>\n📹 এখন মোট ভিডিও: ${result.videoCount}\n🆔 <code>${escapeHtml(result.id)}</code>`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🎬 Topic দেখুন', 'aview:' + result.id)], [Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup });
     } catch (error) {
       console.error('❌ Append Video storage error:', error);
       await ctx.reply('❌ ভিডিও স্টোরেজ চ্যানেলে ফরওয়ার্ড করতে সমস্যা হয়েছে।').catch(() => {});
@@ -1634,7 +1635,7 @@ bot.on('document', async (ctx) => {
       const result = await appendVideoToTopic(appendVideoData[userId].topicId, storedFileId);
       delete appendVideoData[userId];
       if (!result) return ctx.reply('❌ Topic আর পাওয়া যাচ্ছে না।');
-      return ctx.reply(`✅ ভিডিও যুক্ত হয়েছে!\n\n📌 ${escapeHtml(result.title)}\n📹 এখন মোট ভিডিও: ${result.videoCount}\n🆔 <code>${escapeHtml(result.id)}</code>`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🎬 Topic দেখুন', 'aview:' + result.id)], [Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup });
+      return ctx.reply(`✅ ভিডিও যুক্ত হয়েছে!\n\n📌 <code>${escapeHtml(result.title)}</code>\n📹 এখন মোট ভিডিও: ${result.videoCount}\n🆔 <code>${escapeHtml(result.id)}</code>`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🎬 Topic দেখুন', 'aview:' + result.id)], [Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup });
     } catch (error) {
       console.error('❌ Append Video document storage error:', error);
       await ctx.reply('❌ ভিডিও স্টোরেজ চ্যানেলে ফরওয়ার্ড করতে সমস্যা হয়েছে।').catch(() => {});
@@ -2384,7 +2385,7 @@ bot.command('up', async (ctx) => {
   try {
     const result = await moveTopic(topicId, 'up');
     if (result.edge) return ctx.reply('⬆️ এই ভিডিওটি ইতোমধ্যে সবার উপরে আছে।');
-    await ctx.reply(`✅ ভিডিওটি ১ ধাপ উপরে নেওয়া হয়েছে।\n\n📌 ${result.topic.title || 'নামবিহীন টপিক'}\n🆔 <code>${topicId}</code>`, { parse_mode: 'HTML' });
+    await ctx.reply(`✅ ভিডিওটি ১ ধাপ উপরে নেওয়া হয়েছে।\n\n📌 <code>${escapeHtml(result.topic.title || 'নামবিহীন টপিক')}</code>\n🆔 <code>${topicId}</code>`, { parse_mode: 'HTML' });
   } catch (error) {
     if (error.message === 'NOT_FOUND') return ctx.reply('❌ এই Video/Topic ID পাওয়া যায়নি।');
     console.error('❌ /up error:', error);
@@ -2400,7 +2401,7 @@ bot.command('down', async (ctx) => {
   try {
     const result = await moveTopic(topicId, 'down');
     if (result.edge) return ctx.reply('⬇️ এই ভিডিওটি ইতোমধ্যে সবার নিচে আছে।');
-    await ctx.reply(`✅ ভিডিওটি ১ ধাপ নিচে নেওয়া হয়েছে।\n\n📌 ${result.topic.title || 'নামবিহীন টপিক'}\n🆔 <code>${topicId}</code>`, { parse_mode: 'HTML' });
+    await ctx.reply(`✅ ভিডিওটি ১ ধাপ নিচে নেওয়া হয়েছে।\n\n📌 <code>${escapeHtml(result.topic.title || 'নামবিহীন টপিক')}</code>\n🆔 <code>${topicId}</code>`, { parse_mode: 'HTML' });
   } catch (error) {
     if (error.message === 'NOT_FOUND') return ctx.reply('❌ এই Video/Topic ID পাওয়া যায়নি।');
     console.error('❌ /down error:', error);
@@ -2427,7 +2428,7 @@ bot.command('list', async (ctx) => {
       const videoCount = Number(data.videoCount || (Array.isArray(data.videos) ? data.videos.length : 0)) || 0;
       const views = Number(data.unlockCount || data.unlocks || data.views) || 0;
       const ads = Number(data.adsRequired || 0) || 0;
-      return `📌 ${title}\n   🆔 <code>${id}</code>\n   📹 ${videoCount}টি ভিডিও\n   👁️ ${views} ভিউ\n   🔢 ${ads}টি অ্যাড\n\n`;
+      return `📌 <code>${title}</code>\n   🆔 <code>${id}</code>\n   📹 ${videoCount}টি ভিডিও\n   👁️ ${views} ভিউ\n   🔢 ${ads}টি অ্যাড\n\n`;
     });
     await sendHtmlChunks(ctx, '📋 সব টপিক:\n\n', entries);
   } catch (error) {
@@ -2566,7 +2567,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
     if (!topics.length) return ctx.reply('📭 এখনো কোনো Video/Topic নেই।');
     const lines = topics.map((t, i) => {
       const count = Array.isArray(t.videos) ? t.videos.length : (t.videoId ? 1 : 0);
-      return `${i + 1}. ${escapeHtml(t.title || 'নামবিহীন')}\n🆔 <code>${escapeHtml(t.id)}</code>\n📹 Videos: ${count} | 🎯 Ads: ${Number(t.adsRequired || 1)}`;
+      return `${i + 1}. <code>${escapeHtml(t.title || 'নামবিহীন')}</code>\n🆔 <code>${escapeHtml(t.id)}</code>\n📹 Videos: ${count} | 🎯 Ads: ${Number(t.adsRequired || 1)}`;
     });
     const text = `📋 ALL VIDEOS / TOPICS\n\n${lines.join('\n\n')}`;
     return ctx.reply(text, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'adm_videos')]]).reply_markup });
@@ -2576,7 +2577,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
     if (!topics.length) return ctx.reply('📭 কোনো Video/Topic নেই।');
 
     const entries = topics.map((t, i) =>
-      `${i + 1}. 📌 ${escapeHtml(t.title || 'নামবিহীন')}\n   🆔 <code>${escapeHtml(t.id)}</code>\n\n`
+      `${i + 1}. 📌 <code>${escapeHtml(t.title || 'নামবিহীন')}</code>\n   🆔 <code>${escapeHtml(t.id)}</code>\n\n`
     );
     return sendHtmlChunks(ctx, '🆔 VIDEO/TOPIC IDS\n\n', entries);
   }
@@ -2759,7 +2760,7 @@ bot.action(/^aview:(.+)$/, async ctx=>{
   const id=ctx.match[1]; const doc=await db.collection('topics').doc(id).get();
   if(!doc.exists) return ctx.answerCbQuery('❌ Video পাওয়া যায়নি');
   const t=doc.data(); await ctx.answerCbQuery();
-  return ctx.editMessageText(`🎬 VIDEO DETAILS\n\n📌 ${escapeHtml(t.title||'নামবিহীন')}\n🆔 <code>${escapeHtml(id)}</code>\n📹 Videos: ${t.videoCount||0}\n🎯 Ads: ${t.adsRequired||1}\n👁️ Views: ${Number(t.unlockCount||0)}`,{ parse_mode: 'HTML', ...Markup.inlineKeyboard([
+  return ctx.editMessageText(`🎬 VIDEO DETAILS\n\n📌 <code>${escapeHtml(t.title||'নামবিহীন')}</code>\n🆔 <code>${escapeHtml(id)}</code>\n📹 Videos: ${t.videoCount||0}\n🎯 Ads: ${t.adsRequired||1}\n👁️ Views: ${Number(t.unlockCount||0)}`,{ parse_mode: 'HTML', ...Markup.inlineKeyboard([
     [Markup.button.callback('✏️ Rename','av_rename:'+id),Markup.button.callback('🖼️ Thumbnail','av_thumb:'+id)],
     [Markup.button.callback('🎯 Ads','av_ads:'+id),Markup.button.callback('📤 Post','apost_topic:'+id)],
     [Markup.button.callback('🖼️ Thumbnail + Title Post','apost_thumb:'+id)],
@@ -2798,7 +2799,7 @@ bot.action(/^av_delete:(.+)$/, async ctx=>{
   await ctx.answerCbQuery();
   const title = d.exists ? (d.data().title || 'নামবিহীন') : 'নামবিহীন';
   return ctx.editMessageText(
-    `⚠️ আপনি কি নিশ্চিত?\n\n📌 ${escapeHtml(title)}\n🆔 <code>${escapeHtml(id)}</code>\n\nএকবার Delete করলে এটি আর ফেরত আনা যাবে না।`,
+    `⚠️ আপনি কি নিশ্চিত?\n\n📌 <code>${escapeHtml(title)}</code>\n🆔 <code>${escapeHtml(id)}</code>\n\nএকবার Delete করলে এটি আর ফেরত আনা যাবে না।`,
     { parse_mode: 'HTML', ...Markup.inlineKeyboard([
       [Markup.button.callback('✅ হ্যাঁ, Delete করুন', 'av_delete_confirm:'+id), Markup.button.callback('❌ বাতিল', 'aview:'+id)]
     ]) }
@@ -3033,11 +3034,11 @@ bot.action(/^repost_post:(\d+)$/, async ctx => {
   const date = rec.savedAt ? new Date(Number(rec.savedAt)).toLocaleDateString('en-GB') : 'অজানা';
   const media = rec.type === 'photo' ? '🖼️ Photo' : '🎬 Video';
   return ctx.editMessageText(
-    `⚠️ Repost Preview — ঠিক আছে তো?\n\n📢 Channel: ${rec.channelId}\n📦 Type: ${media}\n${rec.topicId ? `🆔 Topic ID: ${rec.topicId}\n` : ''}📅 Save করা হয়েছে: ${date}\n📝 Caption:\n${String(rec.caption || rec.title || '(Caption নেই)').slice(0, 400)}`,
-    Markup.inlineKeyboard([
+    `⚠️ Repost Preview — ঠিক আছে তো?\n\n📢 Channel: ${escapeHtml(String(rec.channelId))}\n📦 Type: ${media}\n${rec.topicId ? `🆔 Topic ID: <code>${escapeHtml(String(rec.topicId))}</code>\n` : ''}📅 Save করা হয়েছে: ${date}\n📝 Caption:\n${escapeHtml(String(rec.caption || rec.title || '(Caption নেই)').slice(0, 400))}`,
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard([
       [Markup.button.callback('✅ হ্যাঁ, Repost করুন', 'repost_confirm:' + index), Markup.button.callback('⬅️ ফিরে যান', 'repost_page:' + (state.page || 1))],
       [Markup.button.callback('🗑 List থেকে Delete', 'repost_del1:' + rec.messageId)]
-    ])
+    ]) }
   );
 });
 
@@ -3279,7 +3280,7 @@ bot.command('stats', async (ctx) => {
       topics.slice(0, 30).forEach((topic, index) => {
         const views = Number(topic.unlockCount || topic.unlocks || topic.views) || 0;
         const title = String(topic.title || 'নামবিহীন').replace(/\n/g, ' ').slice(0, 70);
-        message += `${index + 1}. ${title}\n`;
+        message += `${index + 1}. <code>${escapeHtml(title)}</code>\n`;
         message += `   👁️ ${views} ভিউ\n`;
         message += `   🆔 <code>${topic.id}</code>\n\n`;
       });
@@ -3440,7 +3441,7 @@ async function renderScheduledPostsList(ctx) {
       const sp = d.data();
       const repeatTag = sp.recurrence === 'daily' ? ' 🔁Daily' : sp.recurrence === 'weekly' ? ' 🔁Weekly' : '';
       const title = sp.title || fallbackTitles[sp.topicId] || 'নামবিহীন ভিডিও';
-      text += `${i + 1}. 📌 ${escapeHtml(title)} (🆔 <code>${escapeHtml(sp.topicId)}</code>) | 📅 ${formatDhakaDateTime(sp.scheduledAt)}${repeatTag} | 📢 ${(sp.channels || []).length}টি Channel\n`;
+      text += `${i + 1}. 📌 <code>${escapeHtml(title)}</code> (🆔 <code>${escapeHtml(sp.topicId)}</code>) | 📅 ${formatDhakaDateTime(sp.scheduledAt)}${repeatTag} | 📢 ${(sp.channels || []).length}টি Channel\n`;
       const shortTitle = safeTruncate(title, 26) + (Array.from(title).length > 26 ? '…' : '');
       rows.push([Markup.button.callback(`❌ Cancel: ${shortTitle}`, `schedcancel_ask:${d.id}`)]);
     });
@@ -3468,7 +3469,7 @@ bot.action(/^schedcancel_ask:(.+)$/, async (ctx) => {
     const repeatTag = sp.recurrence === 'daily' ? '\n🔁 প্রতিদিন repeat হচ্ছিল' : sp.recurrence === 'weekly' ? '\n🔁 প্রতি সপ্তাহে repeat হচ্ছিল' : '';
     return ctx.editMessageText(
       `⚠️ আপনি কি নিশ্চিত এই Scheduled Post বাতিল করতে চান?\n\n` +
-      `📌 Title: ${escapeHtml(sp.title || 'নামবিহীন ভিডিও')}\n` +
+      `📌 Title: <code>${escapeHtml(sp.title || 'নামবিহীন ভিডিও')}</code>\n` +
       `🆔 Topic ID: <code>${escapeHtml(sp.topicId)}</code>\n` +
       `📅 সময়: ${formatDhakaDateTime(sp.scheduledAt)}${repeatTag}\n` +
       `📢 Channel: ${(sp.channels || []).length}টি`,
@@ -3976,7 +3977,7 @@ bot.on('text', async (ctx) => {
 
         return ctx.reply(
           `✅ Video/Topic পাওয়া গেছে।\n\n` +
-          `📌 Title: ${escapeHtml(state.title)}\n` +
+          `📌 Title: <code>${escapeHtml(state.title)}</code>\n` +
           `🆔 ID: <code>${escapeHtml(topicId)}</code>\n\n` +
           `✍️ এখন Channel Post-এর Caption লিখুন।\n` +
           `Caption না চাইলে "skip" লিখুন।`,
@@ -3998,7 +3999,7 @@ bot.on('text', async (ctx) => {
       return ctx.reply(
         `👀 Post Preview\n\n` +
         `🎬 Type: ${state.type === 'video' ? 'Video' : 'Photo'}\n` +
-        `📌 Title: ${escapeHtml(state.title || 'নামবিহীন ভিডিও')}\n` +
+        `📌 Title: <code>${escapeHtml(state.title || 'নামবিহীন ভিডিও')}</code>\n` +
         `🆔 Video/Topic ID: <code>${escapeHtml(state.topicId)}</code>\n` +
         `📝 Caption: ${escapeHtml(state.caption || '(কোনো caption নেই)')}\n\n` +
         `Buttons:\n▶️ ভিডিও দেখুন\nHelp Admin\n\n` +
@@ -4064,7 +4065,7 @@ bot.on('text', async (ctx) => {
       if (!text || text.length > 200) return ctx.reply('❌ Title 1-200 অক্ষরের মধ্যে দিন।');
       await db.collection('topics').doc(state.topicId).update({ title: text, updatedAt: new Date().toISOString() });
       delete renameData[userId]; invalidateTopicsCache();
-      return ctx.reply(`✅ Title পরিবর্তন হয়েছে।\n🆔 <code>${escapeHtml(state.topicId)}</code>\n📌 ${escapeHtml(text)}`, { parse_mode: 'HTML' });
+      return ctx.reply(`✅ Title পরিবর্তন হয়েছে।\n🆔 <code>${escapeHtml(state.topicId)}</code>\n📌 <code>${escapeHtml(text)}</code>`, { parse_mode: 'HTML' });
     }
   }
 
@@ -4392,7 +4393,7 @@ async function saveTopic(ctx, data) {
       createdAt: new Date().toISOString()
     });
     invalidateTopicsCache();
-    await ctx.reply(`✅ টপিক "${data.title}" তৈরি হয়েছে!\n📹 ভিডিও সংখ্যা: ${data.videos.length}\n🔢 অ্যাড প্রয়োজন: ${data.adsRequired}\n🆔 টপিক আইডি: <code>${topicRef.id}</code>\n\n📢 এখন Post করবেন কি? (Post Now বা Schedule — শুধু Thumbnail + Title যাবে, ভিডিও যাবে না)`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
+    await ctx.reply(`✅ টপিক <code>${escapeHtml(data.title)}</code> তৈরি হয়েছে!\n📹 ভিডিও সংখ্যা: ${data.videos.length}\n🔢 অ্যাড প্রয়োজন: ${data.adsRequired}\n🆔 টপিক আইডি: <code>${topicRef.id}</code>\n\n📢 এখন Post করবেন কি? (Post Now বা Schedule — শুধু Thumbnail + Title যাবে, ভিডিও যাবে না)`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
       [Markup.button.callback('📢 Post করুন (Thumbnail + Title)', 'apost_thumb:' + topicRef.id)],
       [Markup.button.callback('❌ না, এখন না', 'adm_home')]
     ]).reply_markup });
@@ -4418,7 +4419,7 @@ async function saveVideo(ctx, data) {
       createdAt: new Date().toISOString()
     });
     invalidateTopicsCache();
-    await ctx.reply(`✅ ভিডিও "${data.title}" যোগ হয়েছে!\n🆔 টপিক আইডি: <code>${topicRef.id}</code>\n\n📢 এখন Post করবেন কি? (Post Now বা Schedule — শুধু Thumbnail + Title যাবে, ভিডিও যাবে না)`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
+    await ctx.reply(`✅ ভিডিও <code>${escapeHtml(data.title)}</code> যোগ হয়েছে!\n🆔 টপিক আইডি: <code>${topicRef.id}</code>\n\n📢 এখন Post করবেন কি? (Post Now বা Schedule — শুধু Thumbnail + Title যাবে, ভিডিও যাবে না)`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
       [Markup.button.callback('📢 Post করুন (Thumbnail + Title)', 'apost_thumb:' + topicRef.id)],
       [Markup.button.callback('❌ না, এখন না', 'adm_home')]
     ]).reply_markup });
@@ -4449,7 +4450,7 @@ async function saveDuplicateTopic(ctx, data) {
     });
     invalidateTopicsCache();
     await ctx.reply(
-      `✅ Topic Duplicate হয়ে গেছে!\n\n📌 ${data.title}\n📹 ভিডিও সংখ্যা: ${data.videos.length}\n🔢 অ্যাড প্রয়োজন: ${data.adsRequired}\n🆔 নতুন টপিক আইডি: <code>${topicRef.id}</code>\n\n(Title/Thumbnail/Ads পুরোনো টপিক থেকে কপি করা হয়েছে।)`,
+      `✅ Topic Duplicate হয়ে গেছে!\n\n📌 <code>${escapeHtml(data.title)}</code>\n📹 ভিডিও সংখ্যা: ${data.videos.length}\n🔢 অ্যাড প্রয়োজন: ${data.adsRequired}\n🆔 নতুন টপিক আইডি: <code>${topicRef.id}</code>\n\n(Title/Thumbnail/Ads পুরোনো টপিক থেকে কপি করা হয়েছে।)`,
       { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup }
     );
   } catch (error) {
