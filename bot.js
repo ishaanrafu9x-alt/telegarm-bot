@@ -332,6 +332,25 @@ function scheduleTopicsIndexRebuild() {
     rebuildTopicsIndex().catch(e => console.error('❌ topicsIndex rebuild error:', e.message));
   }, 4000);
 }
+// Unlocks in the last 7 days (today + 6 previous Dhaka days). Uses the per-day
+// map; falls back to recentUnlocks timestamps for topics that have no per-day
+// data yet (older unlocks from before this field existed).
+function weekUnlocksOf(t) {
+  let byDay = 0;
+  const map = t && t.unlockByDay && typeof t.unlockByDay === 'object' ? t.unlockByDay : null;
+  if (map) {
+    for (let i = 0; i < 7; i++) {
+      byDay += Number(map[getDhakaDateKey(new Date(Date.now() - i * 86400000))]) || 0;
+    }
+  }
+  const cut = Date.now() - 7 * 86400000;
+  const recent = (Array.isArray(t && t.recentUnlocks) ? t.recentUnlocks : []).reduce((n, v) => {
+    const x = typeof v === 'number' ? v : new Date(v).getTime();
+    return n + (Number.isFinite(x) && x >= cut ? 1 : 0);
+  }, 0);
+  return Math.max(byDay, recent);
+}
+
 async function rebuildTopicsIndex() {
   const topics = await getTopicsCached();
   // 🐛 FIX: this used to spread `...rest`, which kept `postRecords` on every
@@ -358,7 +377,8 @@ async function rebuildTopicsIndex() {
     sortOrder: t.sortOrder,
     createdAt: t.createdAt || null,
     videoCount: Number(t.videoCount) || (Array.isArray(t.videos) ? t.videos.length : 0),
-    unlockCount: Number(t.unlockCount) || 0 // 🐛 FIX: views missing → Trending/Popular looked the same
+    unlockCount: Number(t.unlockCount) || 0, // 🐛 FIX: views missing → Trending/Popular looked the same
+    weekUnlocks: weekUnlocksOf(t) // Trending = most unlocks in the last 7 days
   }));
   await db.collection('system').doc('topicsIndex').set({ cards, updatedAt: Date.now() });
   console.log(`🗂️ topicsIndex rebuilt (${cards.length} topics)`);
@@ -564,6 +584,8 @@ function applyUnlockToCaches(topicId, count, lastTs) {
       t.dailyUnlockDate = todayKey;
       t.unlockCount = (Number(t.unlockCount) || 0) + count;
       t.lastUnlockAt = lastTs;
+      const by = t.unlockByDay && typeof t.unlockByDay === 'object' ? t.unlockByDay : (t.unlockByDay = {});
+      by[todayKey] = (Number(by[todayKey]) || 0) + count;
     }
   }
   const single = singleTopicCache.get(String(topicId));
@@ -599,13 +621,24 @@ async function flushUnlockStats() {
             .filter(v => Number.isFinite(v))
             .concat(entry.timestamps)
             .slice(-99);
-          tx.set(topicRef, {
+          // Per-day unlock counts (last ~8 days) — used for the "Trending" tab
+          // (views in the last 7 days). recentUnlocks is capped at 99 entries,
+          // so it cannot rank busy videos correctly on its own.
+          const unlockByDay = Object.assign({}, current.unlockByDay && typeof current.unlockByDay === 'object' ? current.unlockByDay : {});
+          entry.timestamps.forEach(ts => {
+            const k = getDhakaDateKey(new Date(ts));
+            unlockByDay[k] = (Number(unlockByDay[k]) || 0) + 1;
+          });
+          const pruneBefore = getDhakaDateKey(new Date(Date.now() - 8 * 86400000));
+          Object.keys(unlockByDay).forEach(k => { if (k < pruneBefore) delete unlockByDay[k]; });
+          tx.update(topicRef, {
             unlockCount: admin.firestore.FieldValue.increment(entry.count),
             lastUnlockAt: lastTs,
             recentUnlocks,
             dailyUnlockDate: todayKey,
-            dailyUnlockCount
-          }, { merge: true });
+            dailyUnlockCount,
+            unlockByDay
+          });
         });
         applyUnlockToCaches(topicId, entry.count, entry.timestamps[entry.timestamps.length - 1]);
       } catch (e) {
