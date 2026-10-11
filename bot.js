@@ -2776,7 +2776,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       `💵 আনুমানিক আজকের আয় (estimate): ${estTodayRevenue.toFixed(2)} ৳\n`;
     // Per-network breakdown (recorded by the Cloudflare Worker): how many ads
     // each network REALLY served and how often it failed (no fill / SDK error).
-    const nets = [['monetag', 'Monetag'], ['onclicka', 'OnClickA'], ['tads', 'TADS']];
+    const nets = [['monetag', 'Monetag'], ['onclicka', 'OnClickA'], ['richads', 'RichAds']];
     text += `\n📡 Ad Network (served / failed)\n` + nets.map(([k, label]) =>
       `• ${label}: ${Number(stats.byNetwork[k]) || 0} / ${Number(stats.fails[k]) || 0}` + (stats.lastFail[k] ? `\n   ⚠️ last error: ${String(stats.lastFail[k]).slice(0, 90)}` : '')
     ).join('\n') + '\n';
@@ -4922,7 +4922,7 @@ async function deliverUnlockedTopicInner(userId, topicId, userStateHint) {
 let adNetworkRotationCounter = 0;
 function nextAdNetwork() {
   const current = adNetworkRotationCounter++;
-  return ['monetag', 'onclicka', 'tads'][current % 3];
+  return ['monetag', 'onclicka', 'richads'][current % 3];
 }
 
 app.post('/api/ad-start', async (req, res) => {
