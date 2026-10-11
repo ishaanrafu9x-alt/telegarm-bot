@@ -351,6 +351,18 @@ function weekUnlocksOf(t) {
   return Math.max(byDay, recent);
 }
 
+// Unlocks today. The Cloudflare Worker (the real production unlock path) only
+// writes the per-day map `unlockByDay.<day>` — the bot's own flush additionally
+// writes dailyUnlockDate/dailyUnlockCount. Use whichever is larger so both
+// sources count, whichever one recorded the unlock.
+function todayUnlocksOf(t, key) {
+  const day = key || getDhakaDateKey();
+  const map = t && t.unlockByDay && typeof t.unlockByDay === 'object' ? t.unlockByDay : null;
+  const fromMap = map ? (Number(map[day]) || 0) : 0;
+  const fromDaily = t && t.dailyUnlockDate === day ? (Number(t.dailyUnlockCount) || 0) : 0;
+  return Math.max(fromMap, fromDaily);
+}
+
 async function rebuildTopicsIndex() {
   const topics = await getTopicsCached();
   // 🐛 FIX: this used to spread `...rest`, which kept `postRecords` on every
@@ -599,6 +611,56 @@ const topicsIndexViewsTimer = setInterval(() => {
 }, 3 * 60 * 1000);
 if (typeof topicsIndexViewsTimer.unref === 'function') topicsIndexViewsTimer.unref();
 
+// 🐛 FIX (views stuck at 0 / Trending = Popular = New): the Cloudflare Worker
+// now records every unlock straight into topics/<id> (unlockCount, unlockByDay)
+// and lists the touched topic ids in system/viewDirty. This job (every 3 min,
+// 1 cheap read when idle) re-reads ONLY those topics, patches the in-memory
+// caches and republishes system/topicsIndex — the doc the Mini App reads — so
+// Views / Trending / Popular update without re-scanning every topic.
+let syncingWorkerUnlocks = false;
+async function syncWorkerUnlocks() {
+  if (syncingWorkerUnlocks) return;
+  syncingWorkerUnlocks = true;
+  try {
+    const ref = db.collection('system').doc('viewDirty');
+    const snap = await ref.get();
+    const ids = snap.exists && Array.isArray(snap.data().topicIds) ? snap.data().topicIds.map(String).filter(Boolean) : [];
+    if (!ids.length) return;
+    const batch = ids.slice(0, 40);
+    const docs = await db.getAll(...batch.map(id => db.collection('topics').doc(id)));
+    const pruneBefore = getDhakaDateKey(new Date(Date.now() - 8 * 86400000));
+    for (const d of docs) {
+      if (!d.exists) continue;
+      const fresh = { id: d.id, ...d.data() };
+      if (Array.isArray(topicsCache)) {
+        const cached = topicsCache.find(x => String(x.id) === d.id);
+        if (cached) Object.assign(cached, fresh);
+      }
+      const single = singleTopicCache.get(d.id);
+      if (single && single.data) single.data.unlockCount = Number(fresh.unlockCount) || 0;
+      // keep unlockByDay small (the Worker adds one key per day per topic)
+      const stale = Object.keys(fresh.unlockByDay && typeof fresh.unlockByDay === 'object' ? fresh.unlockByDay : {}).filter(k => k < pruneBefore);
+      if (stale.length) {
+        const args = [];
+        stale.forEach(k => { args.push(new admin.firestore.FieldPath('unlockByDay', k), admin.firestore.FieldValue.delete()); });
+        d.ref.update(...args).catch(() => {});
+      }
+    }
+    await ref.update({ topicIds: admin.firestore.FieldValue.arrayRemove(...batch) });
+    topicsIndexDirty = true;
+    invalidateAdminStatsCache();
+    await rebuildTopicsIndex();
+    topicsIndexDirty = false;
+  } catch (e) {
+    console.error('❌ syncWorkerUnlocks error:', e.message);
+  } finally {
+    syncingWorkerUnlocks = false;
+  }
+}
+const workerUnlockSyncTimer = setInterval(() => { syncWorkerUnlocks().catch(() => {}); }, 3 * 60 * 1000);
+if (typeof workerUnlockSyncTimer.unref === 'function') workerUnlockSyncTimer.unref();
+setTimeout(() => { syncWorkerUnlocks().catch(() => {}); }, 20 * 1000);
+
 async function flushUnlockStats() {
   if (!pendingUnlockStats.size || unlockStatsFlushPromise) return unlockStatsFlushPromise;
   const batch = pendingUnlockStats;
@@ -614,7 +676,7 @@ async function flushUnlockStats() {
           const lastTs = entry.timestamps[entry.timestamps.length - 1];
           const todayKey = getDhakaDateKey(new Date(lastTs));
           const sameDay = current.dailyUnlockDate === todayKey;
-          const dailyUnlockCount = (sameDay ? (Number(current.dailyUnlockCount) || 0) : 0) + entry.count;
+          const dailyUnlockCount = Math.max(sameDay ? (Number(current.dailyUnlockCount) || 0) : 0, todayUnlocksOf(current, todayKey)) + entry.count;
           const existingRecent = Array.isArray(current.recentUnlocks) ? current.recentUnlocks : [];
           const recentUnlocks = existingRecent
             .map(v => typeof v === 'number' ? v : new Date(v).getTime())
@@ -664,7 +726,12 @@ async function getAdStats() {
   const totalAdViews = Number(data.totalAdViews) || 0;
   const byDate = data.adViewsByDate || {};
   const todayAdViews = Number(byDate[today]) || 0;
-  return { totalAdViews, todayAdViews };
+  return {
+    totalAdViews, todayAdViews,
+    byNetwork: data.adViewsByNetwork || {},
+    fails: data.failsByNetwork || {},
+    lastFail: data.lastFailReason || {}
+  };
 }
 
 // sentAt can be a number, a numeric string, an ISO date string (very old data)
@@ -2687,7 +2754,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   if (action === 'analytics' || action === 'dashboard') {
     try { await Promise.all([flushAdViews(), flushUnlockStats()]); } catch (_) {}
     const counts = await getUserCountsCached(); const topics = await getTopicsCached();
-    const totalViews = topics.reduce((n,t)=>n+(Number(t.unlockCount)||0),0); const today=getDhakaDateKey(); const todayViews=topics.reduce((n,t)=>n+(t.dailyUnlockDate===today?(Number(t.dailyUnlockCount)||0):0),0);
+    const totalViews = topics.reduce((n,t)=>n+(Number(t.unlockCount)||0),0); const today=getDhakaDateKey(); const todayViews=topics.reduce((n,t)=>n+todayUnlocksOf(t,today),0);
     return ctx.editMessageText(`📊 ${action==='dashboard'?'DASHBOARD':'ANALYTICS'}\n\n👥 Users: ${counts.totalUsers}\n🎬 Videos/Topics: ${topics.length}\n👁️ Total Views: ${totalViews.toLocaleString('en-US')}\n📅 Today: ${todayViews.toLocaleString('en-US')}`, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back','adm_home')]]));
   }
   if (action === 'users') return ctx.reply('👥 User Management\n\nপুরোনো /user command-এর একই user data ব্যবহার করা হবে।', Markup.inlineKeyboard([[Markup.button.callback('📋 User List','adm_userlist'), Markup.button.callback('🔍 Search User','adm_user_search')],[Markup.button.callback('⬅️ Back','adm_home')]]));
@@ -2707,6 +2774,12 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       `⚙️ CPM (প্রতি ১০০০ view): ${cpm} ৳\n` +
       `💵 আনুমানিক মোট আয় (estimate): ${estTotalRevenue.toFixed(2)} ৳\n` +
       `💵 আনুমানিক আজকের আয় (estimate): ${estTodayRevenue.toFixed(2)} ৳\n`;
+    // Per-network breakdown (recorded by the Cloudflare Worker): how many ads
+    // each network REALLY served and how often it failed (no fill / SDK error).
+    const nets = [['monetag', 'Monetag'], ['onclicka', 'OnClickA'], ['tads', 'TADS']];
+    text += `\n📡 Ad Network (served / failed)\n` + nets.map(([k, label]) =>
+      `• ${label}: ${Number(stats.byNetwork[k]) || 0} / ${Number(stats.fails[k]) || 0}` + (stats.lastFail[k] ? `\n   ⚠️ last error: ${String(stats.lastFail[k]).slice(0, 90)}` : '')
+    ).join('\n') + '\n';
     return ctx.editMessageText(text, { parse_mode: 'HTML', ...{ reply_markup: Markup.inlineKeyboard([[Markup.button.callback('⚙️ CPM সেট করুন', 'adm_set_cpm')], [Markup.button.callback('⬅️ Back', 'adm_home')]]).reply_markup } });
   }
   if (action === 'set_cpm') {
@@ -3240,9 +3313,7 @@ bot.command('views', async (ctx) => {
 
     const todayRanking = topics.map(topic => {
       const total = Number(topic.unlockCount || topic.unlocks || topic.views) || 0;
-      const todayCount = topic.dailyUnlockDate === today
-        ? (Number(topic.dailyUnlockCount) || 0)
-        : 0;
+      const todayCount = todayUnlocksOf(topic, today);
       totalViews += total;
       todayViews += todayCount;
       return { title: String(topic.title || 'নামবিহীন').replace(/\n/g, ' ').trim(), views: todayCount };
@@ -3295,7 +3366,7 @@ bot.command('stats', async (ctx) => {
     }, 0);
     const todayKey = getDhakaDateKey();
     const todayViews = topics.reduce((sum, topic) => {
-      return sum + (topic.dailyUnlockDate === todayKey ? (Number(topic.dailyUnlockCount) || 0) : 0);
+      return sum + todayUnlocksOf(topic, todayKey);
     }, 0);
 
     let message =
@@ -4851,7 +4922,7 @@ async function deliverUnlockedTopicInner(userId, topicId, userStateHint) {
 let adNetworkRotationCounter = 0;
 function nextAdNetwork() {
   const current = adNetworkRotationCounter++;
-  return (current % 2 === 0) ? 'monetag' : 'onclicka';
+  return ['monetag', 'onclicka', 'tads'][current % 3];
 }
 
 app.post('/api/ad-start', async (req, res) => {
@@ -5562,7 +5633,7 @@ cron.schedule('0 0 * * *', async () => {
 
     const newUsers = Number((dailyStatsDoc.exists && dailyStatsDoc.data().newUsersByDate || {})[dateKey]) || 0;
     const adViews = Number((adStatsDoc.exists && adStatsDoc.data().adViewsByDate || {})[dateKey]) || 0;
-    const unlocks = topics.reduce((sum, t) => sum + (t.dailyUnlockDate === dateKey ? (Number(t.dailyUnlockCount) || 0) : 0), 0);
+    const unlocks = topics.reduce((sum, t) => sum + todayUnlocksOf(t, dateKey), 0);
 
     const cpm = await getAdCpm();
     const estRevenue = (adViews / 1000) * cpm;
