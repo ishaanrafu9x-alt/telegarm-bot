@@ -365,6 +365,12 @@ function todayUnlocksOf(t, key) {
 
 async function rebuildTopicsIndex() {
   const topics = await getTopicsCached();
+  // Safety: never overwrite the index the Mini App reads with an EMPTY list
+  // (a failed/partial read would otherwise make the app show "no videos").
+  if (!Array.isArray(topics) || topics.length === 0) {
+    console.warn('⚠️ rebuildTopicsIndex skipped: topics list is empty — keeping the existing index.');
+    return;
+  }
   // 🐛 FIX: this used to spread `...rest`, which kept `postRecords` on every
   // card — a history array (up to 50 entries, each with its own caption,
   // title, channelId etc) that the webapp card list never needed. Across
@@ -392,7 +398,9 @@ async function rebuildTopicsIndex() {
     unlockCount: Number(t.unlockCount) || 0, // 🐛 FIX: views missing → Trending/Popular looked the same
     weekUnlocks: weekUnlocksOf(t) // Trending = most unlocks in the last 7 days
   }));
-  await db.collection('system').doc('topicsIndex').set({ cards, updatedAt: Date.now() });
+  // `cardsJson` = the same list as ONE string: the Cloudflare Worker reads it with a
+  // single JSON.parse instead of decoding ~234 typed Firestore maps (slow / CPU heavy).
+  await db.collection('system').doc('topicsIndex').set({ cards, cardsJson: JSON.stringify(cards), updatedAt: Date.now() });
   console.log(`🗂️ topicsIndex rebuilt (${cards.length} topics)`);
 }
 // Always rebuilds on startup (not just "if missing") so a bad/bloated
