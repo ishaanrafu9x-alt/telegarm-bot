@@ -507,6 +507,33 @@ function cleanupAdTokens() {
 // 💰 Revenue tracking: admin sets an estimated CPM (revenue per 1000 ad
 // views) since third-party ad networks (libtl.com etc.) don't expose a
 // revenue API here — this gives an estimate based on real ad-view counts.
+// ---------- Ad network on/off switches (Ads Management → Ad Networks) ----------
+// Stored in Firestore system/adSettings. The Cloudflare Worker reads it (cached ~60s)
+// and the Mini App only uses the networks that are switched on.
+const AD_SETTING_DEFAULTS = { monetag: true, onclicka: true, richads: false, richadsBanner: true };
+const AD_SETTING_LABELS = {
+  monetag: 'Monetag',
+  onclicka: 'OnClickA',
+  richads: 'RichAds (unlock ad)',
+  richadsBanner: 'RichAds Banner'
+};
+async function readAdSettings() {
+  const doc = await db.collection('system').doc('adSettings').get();
+  const raw = doc.exists ? doc.data() : {};
+  const s = { ...AD_SETTING_DEFAULTS };
+  for (const k of Object.keys(AD_SETTING_DEFAULTS)) if (typeof raw[k] === 'boolean') s[k] = raw[k];
+  return s;
+}
+function adNetworksView(s) {
+  const text = '📡 AD NETWORKS\n\n' +
+    Object.keys(AD_SETTING_LABELS).map(k => `${s[k] ? '🟢 ON ' : '🔴 OFF'}  ${AD_SETTING_LABELS[k]}`).join('\n') +
+    '\n\nবাটন চাপলে ON/OFF হবে। পরিবর্তন ~১ মিনিটের মধ্যে Mini App-এ কার্যকর হয়।\n' +
+    '⚠️ Monetag / OnClickA / RichAds (unlock ad) — অন্তত একটা চালু থাকতেই হবে।';
+  const rows = Object.keys(AD_SETTING_LABELS).map(k => [Markup.button.callback(`${s[k] ? '🟢' : '🔴'} ${AD_SETTING_LABELS[k]}: ${s[k] ? 'ON' : 'OFF'}`, `adm_nettoggle_${k}`)]);
+  rows.push([Markup.button.callback('⬅️ Back', 'adm_ads')]);
+  return { text, keyboard: Markup.inlineKeyboard(rows) };
+}
+
 async function getAdCpm() {
   const now = Date.now();
   if ((now - adCpmCacheAt) < DAILY_LIMIT_CACHE_TTL) return adCpmCache;
@@ -2768,7 +2795,24 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   if (action === 'users') return ctx.reply('👥 User Management\n\nপুরোনো /user command-এর একই user data ব্যবহার করা হবে।', Markup.inlineKeyboard([[Markup.button.callback('📋 User List','adm_userlist'), Markup.button.callback('🔍 Search User','adm_user_search')],[Markup.button.callback('⬅️ Back','adm_home')]]));
   if (action === 'user_search') { userSearchData[ctx.from.id] = { step: 'query' }; return ctx.reply('🔍 নাম, Username অথবা User ID লিখে পাঠান:'); }
   if (action === 'userlist') { adminUserCursor=null; adminUserPage=1; const snap=await db.collection('users').orderBy('createdAt','desc').limit(25).get(); if(snap.empty) return ctx.reply('📭 কোনো user নেই।'); adminUserCursor=snap.docs[snap.docs.length-1]; return sendUserPage(ctx,snap.docs,1); }
-  if (action === 'ads') return ctx.reply('📺 Ads Management', Markup.inlineKeyboard([[Markup.button.callback('🎯 Set Video Ads','adm_set_ads')],[Markup.button.callback('🎯 Daily Limit','adm_daily_limit')],[Markup.button.callback('⬅️ Back','adm_home')]]));
+  if (action === 'networks' || action.startsWith('nettoggle_')) {
+    let s = await readAdSettings();
+    if (action.startsWith('nettoggle_')) {
+      const key = action.slice('nettoggle_'.length);
+      if (!Object.prototype.hasOwnProperty.call(AD_SETTING_DEFAULTS, key)) return;
+      const next = { ...s, [key]: !s[key] };
+      const unlockNets = ['monetag', 'onclicka', 'richads'];
+      if (unlockNets.includes(key) && !unlockNets.some(n => next[n])) {
+        return ctx.answerCbQuery('⚠️ অন্তত একটা Ad Network চালু রাখতে হবে', { show_alert: true }).catch(() => {});
+      }
+      await db.collection('system').doc('adSettings').set({ [key]: next[key], updatedAt: Date.now() }, { merge: true });
+      s = next;
+    }
+    const view = adNetworksView(s);
+    try { return await ctx.editMessageText(view.text, view.keyboard); }
+    catch (e) { return ctx.reply(view.text, view.keyboard); }
+  }
+  if (action === 'ads') return ctx.reply('📺 Ads Management', Markup.inlineKeyboard([[Markup.button.callback('📡 Ad Networks (ON/OFF)','adm_networks')],[Markup.button.callback('🎯 Set Video Ads','adm_set_ads')],[Markup.button.callback('🎯 Daily Limit','adm_daily_limit')],[Markup.button.callback('⬅️ Back','adm_home')]]));
   if (action === 'set_ads') { updateAdsData[ctx.from.id]={step:'topicId'}; return ctx.reply('🎯 Video/Topic ID পাঠান:'); }
   if (action === 'daily_limit') { const current=await getDailyAdLimit(); updateAdsData[ctx.from.id]={step:'dailyLimit'}; return ctx.reply(`📊 বর্তমান Daily Ad Limit: ${current}টি\n\nনতুন limit লিখুন:`); }
   if (action === 'revenue') {
