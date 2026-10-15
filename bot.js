@@ -39,6 +39,28 @@ function safeTruncate(value, maxLen) {
   return truncated.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
 }
 
+// ⚡ SPEED: Telegraf's polling loop waits for EVERY handler of a batch to finish before it
+// asks Telegram for the next updates. One slow handler (a post, a broadcast, a big
+// Firestore read…) therefore froze every other button click. Handlers now run in the
+// background: the polling loop returns at once, button clicks run immediately, and normal
+// messages of the same user still run one after another (keeps upload/flow order intact).
+const userMessageChains = new Map();
+bot.use((ctx, next) => {
+  const reportError = (err) => {
+    try { if (typeof bot.handleError === 'function') bot.handleError(err, ctx); else console.error('🚨 Handler error:', err && err.message); }
+    catch (e) { console.error('🚨 Handler error:', e && e.message); }
+  };
+  if (ctx.updateType === 'callback_query') {
+    Promise.resolve().then(next).catch(reportError);
+    return;
+  }
+  const key = String((ctx.from && ctx.from.id) || (ctx.chat && ctx.chat.id) || 'x');
+  const prev = userMessageChains.get(key) || Promise.resolve();
+  const run = prev.then(() => next()).catch(reportError);
+  userMessageChains.set(key, run);
+  run.then(() => { if (userMessageChains.get(key) === run) userMessageChains.delete(key); });
+});
+
 // 🚫 NEVER process posts coming from Telegram channels.
 // The bot should only process user/private/group updates. This guard is the
 // final protection against Public Posting Channel media being copied to
@@ -1232,11 +1254,36 @@ async function addChannelRecord(data) {
   return { id: ref.id, ...data, active: true };
 }
 
+// The panel numbers (users / videos / channels) used to be fetched fresh on every open —
+// when a cache had expired that meant a Firestore round-trip before the buttons appeared.
+// Now the last known numbers are shown INSTANTLY and refreshed in the background.
+let panelStats = { users: null, topics: null, channels: null, at: 0 };
+let panelStatsRefreshing = null;
+function refreshPanelStats() {
+  if (panelStatsRefreshing) return panelStatsRefreshing;
+  panelStatsRefreshing = (async () => {
+    const [counts, topics, channels] = await Promise.all([getUserCountsCached(), getTopicsCached(), getChannels()]);
+    panelStats = { users: counts.totalUsers, topics: topics.length, channels: channels.length, at: Date.now() };
+  })().catch(e => console.error('panel stats refresh failed:', e.message)).finally(() => { panelStatsRefreshing = null; });
+  return panelStatsRefreshing;
+}
+async function getPanelStats() {
+  const fresh = panelStats.users !== null && Date.now() - panelStats.at < 30 * 1000;
+  if (!fresh) {
+    const p = refreshPanelStats();
+    // Only the very first open may wait (max 2.5s); afterwards stale numbers are shown at once.
+    if (panelStats.users === null) await Promise.race([p, new Promise(r => setTimeout(r, 2500))]);
+  }
+  return panelStats;
+}
+
+// Only ONE admin panel message per chat: when a new panel has to be sent, the previous
+// one is deleted, so panels no longer pile up in the chat.
+const lastPanelMsg = new Map();
 async function sendAdminPanel(ctx, edit = false) {
-  const counts = await getUserCountsCached();
-  const topics = await getTopicsCached();
-  const channels = await getChannels();
-  const text = `👑 PREMIUM ADMIN PANEL\n\n👥 Users: ${counts.totalUsers}\n🎬 Videos/Topics: ${topics.length}\n📢 Channels: ${channels.length}\n\n👇 একটি অপশন বেছে নিন:`;
+  const st = await getPanelStats();
+  const fmt = (n) => (n === null || n === undefined ? '…' : n);
+  const text = `👑 PREMIUM ADMIN PANEL\n\n👥 Users: ${fmt(st.users)}\n🎬 Videos/Topics: ${fmt(st.topics)}\n📢 Channels: ${fmt(st.channels)}\n\n👇 একটি অপশন বেছে নিন:`;
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback('📊 Dashboard', 'adm_dashboard'), Markup.button.callback('🎬 Videos', 'adm_videos')],
     [Markup.button.callback('📢 Channels', 'adm_channels'), Markup.button.callback('📤 Create Post', 'adm_create_post')],
@@ -1247,10 +1294,25 @@ async function sendAdminPanel(ctx, edit = false) {
     [Markup.button.callback('👑 VIP Subscription', 'adm_vip')],
     [Markup.button.callback('⌨️ Keyboard Show', 'adm_kb_show'), Markup.button.callback('❌ Keyboard Hide', 'adm_kb_hide')]
   ]);
-  if (edit && ctx.callbackQuery?.message) {
-    return ctx.editMessageText(text, keyboard).catch(() => ctx.reply(text, keyboard));
+  const chatId = ctx.chat && ctx.chat.id;
+  const cbMsg = ctx.callbackQuery && ctx.callbackQuery.message;
+  if (edit && cbMsg) {
+    try {
+      const r = await ctx.editMessageText(text, keyboard);
+      if (chatId) lastPanelMsg.set(chatId, cbMsg.message_id);
+      return r;
+    } catch (e) {
+      if (/not modified/i.test(e && e.message)) { if (chatId) lastPanelMsg.set(chatId, cbMsg.message_id); return; }
+      // anything else → fall through and send a fresh panel
+    }
   }
-  return ctx.reply(text, keyboard);
+  const prev = chatId ? lastPanelMsg.get(chatId) : null;
+  const sent = await ctx.reply(text, keyboard);
+  if (chatId && sent && sent.message_id) {
+    lastPanelMsg.set(chatId, sent.message_id);
+    if (prev && prev !== sent.message_id) ctx.telegram.deleteMessage(chatId, prev).catch(() => {});
+  }
+  return sent;
 }
 
 // ⌨️ ADMIN-ONLY fixed reply keyboard (always visible under the message box).
@@ -1868,9 +1930,9 @@ bot.command('cancel', async (ctx) => {
   delete addTopicData[userId];
   delete addVideoData[userId];
   if (!wasActive) {
-    return ctx.reply('ℹ️ কোনো কাজ চলছিল না, তাই বাতিল করার কিছু নেই।');
+    return ctx.reply('ℹ️ কোনো কাজ চলছিল না, তাই বাতিল করার কিছু নেই।', Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]));
   }
-  return ctx.reply('✅ চলমান কাজটি বাতিল করা হয়েছে। /admin দিয়ে আবার শুরু করতে পারেন।');
+  return ctx.reply('✅ চলমান কাজটি বাতিল করা হয়েছে।', Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]));
 });
 
 // =============================================
@@ -2092,7 +2154,7 @@ bot.action('post_cancel', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
   delete postData[ctx.from.id];
   await ctx.answerCbQuery('Cancelled');
-  await ctx.reply('❌ Post বাতিল করা হয়েছে।');
+  await ctx.reply('❌ Post বাতিল করা হয়েছে।', Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]));
 });
 
 // =============================================
@@ -2391,7 +2453,9 @@ bot.action('post_confirm', async (ctx) => {
   const helpLink = await getHelpAdminLink();
   if (!helpLink) return ctx.answerCbQuery('❌ /setlink দিয়ে Help Admin link সেট করুন');
 
-  await ctx.answerCbQuery('Posting...');
+  ctx.answerCbQuery('Posting...').catch(() => {});
+  // Remove the Post Now / Schedule buttons from the preview so it cannot be posted twice.
+  ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
   try {
     const keyboard = await buildConfiguredPostKeyboard(state.topicId);
     const lines = [];
@@ -2641,7 +2705,27 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
   const action = ctx.match[1];
   console.log('👑 Admin button:', action, 'by', ctx.from && ctx.from.id);
-  try { await ctx.answerCbQuery(); } catch (e) {}
+  // Answer the tap immediately without waiting for Telegram's reply (saves a full round-trip).
+  try { ctx.answerCbQuery().catch(() => {}); } catch (e) {}
+  // Panel navigation edits the message you tapped in instead of sending a NEW message each
+  // time (that was why so many admin panels / menus piled up in the chat).
+  const cbMsg = ctx.callbackQuery && ctx.callbackQuery.message;
+  if (cbMsg && typeof cbMsg.text === 'string' && !String(ctx.callbackQuery.id).startsWith('kb_')) {
+    const origReply = ctx.reply.bind(ctx);
+    let edited = false;
+    ctx.reply = async (text, extra) => {
+      const kb = extra && (extra.reply_markup || (Array.isArray(extra.inline_keyboard) ? extra : null));
+      if (!edited && typeof text === 'string' && kb && Array.isArray(kb.inline_keyboard)) {
+        edited = true;
+        try { return await ctx.editMessageText(text, extra); }
+        catch (e) {
+          if (/not modified/i.test(e && e.message)) return;
+          edited = false; // can't edit this one → send normally
+        }
+      }
+      return origReply(text, extra);
+    };
+  }
   try {
   if (action === 'home') return sendAdminPanel(ctx, true);
   if (action === 'vip') {
@@ -3828,7 +3912,7 @@ bot.action('bcast_cancel', async (ctx) => {
   if (!adminOnly(ctx)) return ctx.answerCbQuery('❌');
   delete broadcastData[ctx.from.id];
   await ctx.answerCbQuery('বাতিল হয়েছে');
-  return ctx.editMessageText('❌ Broadcast বাতিল করা হয়েছে।');
+  return ctx.editMessageText('❌ Broadcast বাতিল করা হয়েছে।', Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]));
 });
 
 // 📣 Broadcast goes to EVERY user who has not blocked the bot (verified or not).
