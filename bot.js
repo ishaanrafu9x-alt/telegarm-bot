@@ -61,6 +61,24 @@ bot.use((ctx, next) => {
   run.then(() => { if (userMessageChains.get(key) === run) userMessageChains.delete(key); });
 });
 
+// 🚫 Block / Unblock by ID: after the admin taps the button, the NEXT text message is the user id.
+const pendingBlockInput = {};
+bot.use(async (ctx, next) => {
+  const uid = ctx.from && ctx.from.id;
+  const mode = uid && pendingBlockInput[uid];
+  if (!mode || !ctx.message || typeof ctx.message.text !== 'string') return next();
+  const text = ctx.message.text.trim();
+  delete pendingBlockInput[uid];
+  if (text.startsWith('/')) return next();            // any command cancels the prompt
+  const id = text.replace(/\D/g, '');
+  const back = Markup.inlineKeyboard([[Markup.button.callback('👥 Users', 'adm_users'), Markup.button.callback('🏠 Admin Panel', 'adm_home')]]);
+  if (!id) return ctx.reply('⚠️ সঠিক User ID (শুধু সংখ্যা) দিন। আবার চেষ্টা করতে Users > Block by ID চাপুন।', back);
+  await db.collection('users').doc(id).set({ blocked: mode === 'block' }, { merge: true });
+  return ctx.reply(mode === 'block'
+    ? `🚫 Blocked (silent): ${id}\n\nসে app ব্যবহার ও Ad দেখতে পারবে (Revenue আসবে), কিন্তু কোনো ভিডিও পাবে না এবং Payment bot-এও মেসেজ পাবে না। সে unlock করলেই আপনি alert পাবেন।`
+    : `✅ Unblocked: ${id}`, back);
+});
+
 // 🚫 NEVER process posts coming from Telegram channels.
 // The bot should only process user/private/group updates. This guard is the
 // final protection against Public Posting Channel media being copied to
@@ -717,6 +735,10 @@ async function syncWorkerUnlocks() {
 const workerUnlockSyncTimer = setInterval(() => { syncWorkerUnlocks().catch(() => {}); }, 3 * 60 * 1000);
 if (typeof workerUnlockSyncTimer.unref === 'function') workerUnlockSyncTimer.unref();
 setTimeout(() => { syncWorkerUnlocks().catch(() => {}); }, 20 * 1000);
+setTimeout(() => {
+  db.collection('system').doc('alertConfig').set({ adminId: String(ADMIN_ID), updatedAt: Date.now() }, { merge: true })
+    .catch(e => console.error('alertConfig write failed:', e.message));
+}, 8 * 1000);
 
 async function flushUnlockStats() {
   if (!pendingUnlockStats.size || unlockStatsFlushPromise) return unlockStatsFlushPromise;
@@ -1615,9 +1637,6 @@ bot.start(async (ctx) => {
         return ctx.reply('🎬 আপনার unlocked video পাঠানো হয়েছে।');
       } catch (deliveryError) {
         console.error('❌ Pending topic delivery error:', deliveryError.message);
-        if (deliveryError.message === 'User is blocked') {
-          return ctx.reply('⛔ আপনাকে এই বট ব্যবহার থেকে ব্লক করা হয়েছে।');
-        }
         return ctx.reply('❌ ভিডিও পাঠাতে সমস্যা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।');
       }
     }
@@ -2876,7 +2895,14 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
     const totalViews = topics.reduce((n,t)=>n+(Number(t.unlockCount)||0),0); const today=getDhakaDateKey(); const todayViews=topics.reduce((n,t)=>n+todayUnlocksOf(t,today),0);
     return ctx.editMessageText(`📊 ${action==='dashboard'?'DASHBOARD':'ANALYTICS'}\n\n👥 Users: ${counts.totalUsers}\n🎬 Videos/Topics: ${topics.length}\n👁️ Total Views: ${totalViews.toLocaleString('en-US')}\n📅 Today: ${todayViews.toLocaleString('en-US')}`, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back','adm_home')]]));
   }
-  if (action === 'users') return ctx.reply('👥 User Management\n\nপুরোনো /user command-এর একই user data ব্যবহার করা হবে।', Markup.inlineKeyboard([[Markup.button.callback('📋 User List','adm_userlist'), Markup.button.callback('🔍 Search User','adm_user_search')],[Markup.button.callback('⬅️ Back','adm_home')]]));
+  if (action === 'users') return ctx.reply('👥 User Management\n\nপুরোনো /user command-এর একই user data ব্যবহার করা হবে।', Markup.inlineKeyboard([[Markup.button.callback('📋 User List','adm_userlist'), Markup.button.callback('🔍 Search User','adm_user_search')],[Markup.button.callback('🚫 Block by ID','adm_block_id'), Markup.button.callback('✅ Unblock by ID','adm_unblock_id')],[Markup.button.callback('⬅️ Back','adm_home')]]));
+  if (action === 'block_id' || action === 'unblock_id') {
+    pendingBlockInput[ctx.from.id] = action === 'block_id' ? 'block' : 'unblock';
+    return ctx.reply(action === 'block_id'
+      ? '🚫 যে user-কে Block করবেন তার User ID (শুধু সংখ্যা) পাঠান:\n\n(Block হলে সে app ব্যবহার ও Ad দেখতে পারবে, কিন্তু ভিডিও পাবে না; Payment bot-এও মেসেজ পাবে না।)'
+      : '✅ যে user-কে Unblock করবেন তার User ID (শুধু সংখ্যা) পাঠান:',
+      Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'adm_users')]]));
+  }
   if (action === 'user_search') { userSearchData[ctx.from.id] = { step: 'query' }; return ctx.reply('🔍 নাম, Username অথবা User ID লিখে পাঠান:'); }
   if (action === 'userlist') { adminUserCursor=null; adminUserPage=1; const snap=await db.collection('users').orderBy('createdAt','desc').limit(25).get(); if(snap.empty) return ctx.reply('📭 কোনো user নেই।'); adminUserCursor=snap.docs[snap.docs.length-1]; return sendUserPage(ctx,snap.docs,1); }
   if (action === 'networks' || action.startsWith('nettoggle_')) {
@@ -3541,7 +3567,7 @@ bot.command('block', async (ctx) => {
   const targetId = args[1];
   if (!targetId) return ctx.reply('ব্যবহার: /block <userId>');
   await db.collection('users').doc(targetId).set({ blocked: true }, { merge: true });
-  return ctx.reply(`🚫 Blocked: ${targetId}`);
+  return ctx.reply(`🚫 Blocked (silent): ${targetId}\n\nএই user এখনও app ব্যবহার করতে ও Ad দেখতে পারবে (Revenue আসবে), কিন্তু কোনো ভিডিও পাবে না। সে কিছু unlock করলেই আপনি alert পাবেন। User কিছু জানতে পারবে না।`);
 });
 
 bot.command('unblock', async (ctx) => {
@@ -4890,6 +4916,77 @@ app.get('/api/user-unlocked/:userId', async (req, res) => {
   }
 });
 
+// 🚫 SILENT BLOCK: a blocked user can still use the app and watch ads (so ad revenue still
+// counts) but never receives a video. The admin gets an alert through the PAYMENT bot when
+// PAYMENT_BOT_TOKEN is set (otherwise through this bot). The user is told nothing.
+// Payment bot token: either set Render env PAYMENT_BOT_TOKEN, or paste it between the quotes below
+// (only do that if your GitHub repo is PRIVATE — anyone who sees the repo could see the token).
+const PAYMENT_BOT_TOKEN_IN_CODE = 'PASTE_PAYMENT_BOT_TOKEN_HERE';
+function paymentBotToken() {
+  const tk = String(process.env.PAYMENT_BOT_TOKEN || PAYMENT_BOT_TOKEN_IN_CODE || '').trim();
+  return tk && !tk.startsWith('PASTE_') ? tk : '';
+}
+// VIP added from THIS bot → the user also gets the usual "VIP activated" message from the
+// PAYMENT bot (same text the payment bot sends on approval). It only reaches users who have
+// pressed /start in the payment bot, and never a blocked user. Returns a status line for the admin.
+async function notifyVipViaPaymentBot(userId, expiry) {
+  const token = paymentBotToken();
+  if (!token) return 'ℹ️ Payment bot token সেট নেই — user-কে Payment bot থেকে মেসেজ যায়নি।';
+  if (typeof fetch !== 'function') return 'ℹ️ Payment bot মেসেজ পাঠানো যায়নি (Node fetch নেই)।';
+  try {
+    const [uDoc, pDoc] = await Promise.all([
+      db.collection('users').doc(String(userId)).get(),
+      db.collection('paymentBotUsers').doc(String(userId)).get()
+    ]);
+    if (uDoc.exists && uDoc.data().blocked === true) return '🚫 User blocked — Payment bot মেসেজ পাঠানো হয়নি।';
+    const lang = pDoc.exists && pDoc.data().lang === 'en' ? 'en' : 'bn';
+    const dateStr = new Date(expiry).toLocaleString(lang === 'bn' ? 'bn-BD' : 'en-US', { timeZone: 'Asia/Dhaka', dateStyle: 'medium', timeStyle: 'short' });
+    const text = lang === 'en'
+      ? `🎉 Congrats! Your VIP has been activated.\n\n⏰ Expires: ${dateStr}\n\nGo enjoy every video ad-free on Premium Video! 👑`
+      : `🎉 অভিনন্দন! আপনার VIP Activate করা হয়েছে।\n\n⏰ মেয়াদ শেষ হবে: ${dateStr}\n\nএখন Premium Video app-এ গিয়ে কোনো Ad ছাড়াই সব ভিডিও দেখতে পারবেন! 👑`;
+    const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: String(userId), text })
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) return '📨 Payment bot থেকে user-কে মেসেজ পাঠানো হয়েছে।';
+    if (/can't initiate|chat not found|blocked/i.test(j.description || '')) return 'ℹ️ User Payment bot-এ /start দেয়নি — মেসেজ পাঠানো যায়নি (VIP ঠিকই active)।';
+    return `⚠️ Payment bot মেসেজ যায়নি: ${j.description || r.status}`;
+  } catch (e) {
+    return '⚠️ Payment bot মেসেজ পাঠাতে সমস্যা: ' + e.message;
+  }
+}
+const recentBlockedAlerts = new Map();
+async function sendAdminAlert(text) {
+  const payToken = paymentBotToken();
+  if (payToken && typeof fetch === 'function') {
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${payToken}/sendMessage`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chat_id: ADMIN_ID, text })
+      });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok && j.ok) return true;
+    } catch (e) { /* fall back to the main bot */ }
+  }
+  try { await bot.telegram.sendMessage(ADMIN_ID, text); return true; }
+  catch (e) { console.error('❌ admin alert failed:', e.message); return false; }
+}
+async function notifyAdminBlockedUnlock(userId, topicId, userData) {
+  const key = userId + ':' + topicId;
+  if (Date.now() - (recentBlockedAlerts.get(key) || 0) < 30 * 1000) return;
+  recentBlockedAlerts.set(key, Date.now());
+  let title = topicId;
+  try { const t = (await getTopicsCached()).find(x => String(x.id) === String(topicId)); if (t && t.title) title = t.title; } catch (e) {}
+  const name = [userData.firstName, userData.lastName].filter(Boolean).join(' ') || userData.name || 'Unknown';
+  await sendAdminAlert(
+    '🚫 BLOCKED USER UNLOCKED A VIDEO\n\n' +
+    `👤 ${name}${userData.username ? ' (@' + userData.username + ')' : ''}\n` +
+    `🆔 ${userId}\n🎬 ${title} (ID: ${topicId})\n\n` +
+    '❌ Video পাঠানো হয়নি (silent block)। User কিছু জানে না।'
+  );
+}
+
 async function deliverUnlockedTopic(userId, topicId, userStateHint) {
   inflightDeliveries++;
   try {
@@ -4924,7 +5021,8 @@ async function deliverUnlockedTopicInner(userId, topicId, userStateHint) {
   // /start pending-unlock flow) — a blocked user never gets a video, no
   // matter which route triggered this call.
   if (data.blocked === true) {
-    throw new Error('User is blocked');
+    notifyAdminBlockedUnlock(String(userId), String(topicId), data).catch(() => {});
+    return { success: true, videosDelivered: 0, silentlyBlocked: true };
   }
 
   const unlockedTopics = Array.isArray(data.unlockedTopics) ? data.unlockedTopics.slice() : [];
@@ -5458,9 +5556,10 @@ async function grantVipSubscription(ctx, userId, days) {
       return result;
     });
     armVipTimer(userId, newExpiry);
+    const payNote = await notifyVipViaPaymentBot(userId, newExpiry);
     const dateStr = new Date(newExpiry).toLocaleString('bn-BD', { timeZone: 'Asia/Dhaka', dateStyle: 'medium', timeStyle: 'short' });
     return ctx.reply(
-      `✅ VIP Subscription active করা হয়েছে!\n\n👤 User ID: <code>${userId}</code>\n➕ যোগ হয়েছে: ${days} দিন\n⏰ মেয়াদ শেষ হবে: ${dateStr}\n\nএই সময়ে এই user কোনো Ad ছাড়াই ভিডিও unlock করতে পারবে।`,
+      `✅ VIP Subscription active করা হয়েছে!\n\n👤 User ID: <code>${userId}</code>\n➕ যোগ হয়েছে: ${days} দিন\n⏰ মেয়াদ শেষ হবে: ${dateStr}\n\nএই সময়ে এই user কোনো Ad ছাড়াই ভিডিও unlock করতে পারবে।\n\n${payNote}`,
       { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]) }
     );
   } catch (error) {
@@ -5479,9 +5578,10 @@ async function setVipSubscription(ctx, userId, days) {
     const newExpiry = Date.now() + days * 24 * 60 * 60 * 1000;
     await userRef.set({ subscriptionExpiresAt: newExpiry }, { merge: true });
     armVipTimer(userId, newExpiry);
+    const payNote = await notifyVipViaPaymentBot(userId, newExpiry);
     const dateStr = new Date(newExpiry).toLocaleString('bn-BD', { timeZone: 'Asia/Dhaka', dateStyle: 'medium', timeStyle: 'short' });
     return ctx.reply(
-      `✅ VIP মেয়াদ বসানো হয়েছে!\n\n👤 User ID: <code>${userId}</code>\n📅 এখন থেকে: ${days} দিন\n⏰ মেয়াদ শেষ হবে: ${dateStr}`,
+      `✅ VIP মেয়াদ বসানো হয়েছে!\n\n👤 User ID: <code>${userId}</code>\n📅 এখন থেকে: ${days} দিন\n⏰ মেয়াদ শেষ হবে: ${dateStr}\n\n${payNote}`,
       { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]) }
     );
   } catch (error) {
