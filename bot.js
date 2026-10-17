@@ -550,11 +550,12 @@ function cleanupAdTokens() {
 // ---------- Ad network on/off switches (Ads Management → Ad Networks) ----------
 // Stored in Firestore system/adSettings. The Cloudflare Worker reads it (cached ~60s)
 // and the Mini App only uses the networks that are switched on.
-const AD_SETTING_DEFAULTS = { monetag: true, onclicka: true, adsbitvex: true, richads: false, richadsBanner: true };
+const AD_SETTING_DEFAULTS = { monetag: true, onclicka: true, adsbitvex: true, litebits: false, richads: false, richadsBanner: true };
 const AD_SETTING_LABELS = {
   monetag: 'Monetag',
   onclicka: 'OnClickA',
   adsbitvex: 'AdsBitvex',
+  litebits: 'LiteBits',
   richads: 'RichAds (unlock ad)',
   richadsBanner: 'RichAds Banner'
 };
@@ -569,7 +570,7 @@ function adNetworksView(s) {
   const text = '📡 AD NETWORKS\n\n' +
     Object.keys(AD_SETTING_LABELS).map(k => `${s[k] ? '🟢 ON ' : '🔴 OFF'}  ${AD_SETTING_LABELS[k]}`).join('\n') +
     '\n\nবাটন চাপলে ON/OFF হবে। পরিবর্তন ~১ মিনিটের মধ্যে Mini App-এ কার্যকর হয়।\n' +
-    '⚠️ Monetag / OnClickA / AdsBitvex / RichAds (unlock ad) — অন্তত একটা চালু থাকতেই হবে।';
+    '⚠️ Monetag / OnClickA / AdsBitvex / LiteBits / RichAds (unlock ad) — অন্তত একটা চালু থাকতেই হবে।';
   const rows = Object.keys(AD_SETTING_LABELS).map(k => [Markup.button.callback(`${s[k] ? '🟢' : '🔴'} ${AD_SETTING_LABELS[k]}: ${s[k] ? 'ON' : 'OFF'}`, `adm_nettoggle_${k}`)]);
   rows.push([Markup.button.callback('⬅️ Back', 'adm_ads')]);
   return { text, keyboard: Markup.inlineKeyboard(rows) };
@@ -2912,7 +2913,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       const key = action.slice('nettoggle_'.length);
       if (!Object.prototype.hasOwnProperty.call(AD_SETTING_DEFAULTS, key)) return;
       const next = { ...s, [key]: !s[key] };
-      const unlockNets = ['monetag', 'onclicka', 'adsbitvex', 'richads'];
+      const unlockNets = ['monetag', 'onclicka', 'adsbitvex', 'litebits', 'richads'];
       if (unlockNets.includes(key) && !unlockNets.some(n => next[n])) {
         return ctx.answerCbQuery('⚠️ অন্তত একটা Ad Network চালু রাখতে হবে', { show_alert: true }).catch(() => {});
       }
@@ -2939,7 +2940,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       `💵 আনুমানিক আজকের আয় (estimate): ${estTodayRevenue.toFixed(2)} ৳\n`;
     // Per-network breakdown (recorded by the Cloudflare Worker): how many ads
     // each network REALLY served and how often it failed (no fill / SDK error).
-    const nets = [['monetag', 'Monetag'], ['onclicka', 'OnClickA'], ['adsbitvex', 'AdsBitvex'], ['richads', 'RichAds']];
+    const nets = [['monetag', 'Monetag'], ['onclicka', 'OnClickA'], ['adsbitvex', 'AdsBitvex'], ['litebits', 'LiteBits'], ['richads', 'RichAds']];
     text += `\n📡 Ad Network (served / failed)\n` + nets.map(([k, label]) =>
       `• ${label}: ${Number(stats.byNetwork[k]) || 0} / ${Number(stats.fails[k]) || 0}` + (stats.lastFail[k] ? `\n   ⚠️ last error: ${String(stats.lastFail[k]).slice(0, 90)}` : '')
     ).join('\n') + '\n';
