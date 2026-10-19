@@ -550,11 +550,12 @@ function cleanupAdTokens() {
 // ---------- Ad network on/off switches (Ads Management → Ad Networks) ----------
 // Stored in Firestore system/adSettings. The Cloudflare Worker reads it (cached ~60s)
 // and the Mini App only uses the networks that are switched on.
-const AD_SETTING_DEFAULTS = { monetag: true, onclicka: true, gigapub: true, richads: false, richadsBanner: true };
+const AD_SETTING_DEFAULTS = { monetag: true, onclicka: true, gigapub: true, litebits: false, richads: false, richadsBanner: true };
 const AD_SETTING_LABELS = {
   monetag: 'Monetag',
   onclicka: 'OnClickA',
   gigapub: 'GigaPub',
+  litebits: 'LiteBits',
   richads: 'RichAds (unlock ad)',
   richadsBanner: 'RichAds Banner'
 };
@@ -565,12 +566,145 @@ async function readAdSettings() {
   for (const k of Object.keys(AD_SETTING_DEFAULTS)) if (typeof raw[k] === 'boolean') s[k] = raw[k];
   return s;
 }
-function adNetworksView(s) {
+
+// ---------- 🧩 Custom ad networks (add any "script + global function returning a Promise" network from the bot) ----------
+const CUSTOM_NET_FN_RE = /^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*$/;
+async function readCustomNets() {
+  try {
+    const d = await db.collection('system').doc('customNetworks').get();
+    const list = d.exists ? JSON.parse(d.data().json || '[]') : [];
+    return Array.isArray(list) ? list.filter(c => c && /^c_[a-z0-9]{3,12}$/.test(String(c.id))) : [];
+  } catch (e) { console.error('readCustomNets:', e.message); return []; }
+}
+async function writeCustomNets(list) {
+  await db.collection('system').doc('customNetworks').set({ json: JSON.stringify(list), updatedAt: Date.now() });
+}
+const pendingCustomNet = {};
+async function finishCustomNet(ctx, uid, st, method, back) {
+  delete pendingCustomNet[uid];
+  const list = await readCustomNets();
+  if (list.length >= 10) return ctx.reply('⚠️ সর্বোচ্চ ১০টি Custom Network রাখা যায়। আগে একটা মুছুন।', back);
+  const id = 'c_' + Math.random().toString(36).slice(2, 8).replace(/[^a-z0-9]/g, 'x');
+  list.push({ id, name: st.name, scriptUrl: st.scriptUrl, fn: st.fn, args: st.args || '', method: method || '', isNew: !!st.isNew && !!method, enabled: true });
+  await writeCustomNets(list);
+  return ctx.reply(`✅ "${st.name}" যোগ হয়েছে এবং ON আছে।\n\n🔗 ${st.scriptUrl}\n⚙️ ${customNetCall({ fn: st.fn, args: st.args, method, isNew: st.isNew })}\n\n~১ মিনিটের মধ্যে Mini App-এ কার্যকর হবে। Revenue প্যানেলে served/failed দেখে নিশ্চিত হোন Ad আসছে কিনা — না এলে OFF/Delete করে দিন।`, back);
+}
+// 📋 Reads the integration code a network gives you and works out: script URL + how to call it.
+//   window.showX()                    -> fn=showX
+//   new Something({ ... })            -> fn=Something, isNew, args, method=show
+//   window.Something.init({ ... })    -> fn=Something.init, args, method=show
+function parseJsObjectLiteral(str) {
+  try {
+    let t = String(str).replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+    t = t.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (m, g) => '"' + g.replace(/"/g, '\\"') + '"');
+    t = t.replace(/([{,]\s*)([A-Za-z_$][\w$]*)\s*:/g, '$1"$2":');
+    t = t.replace(/,\s*([}\]])/g, '$1');
+    const o = JSON.parse(t);
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
+    const keys = Object.keys(o);
+    if (!keys.length || keys.length > 10) return null;
+    for (const k of keys) {
+      const v = o[k];
+      if (!/^[A-Za-z_$][\w$]*$/.test(k)) return null;
+      if (!((typeof v === 'string' && v.length <= 200) || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)))) return null;
+    }
+    const out = JSON.stringify(o);
+    return out.length <= 400 ? out : null;
+  } catch (_) { return null; }
+}
+function parseAdSnippet(text) {
+  const PATH = '[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*';
+  const r = { scriptUrl: null, fn: null, args: '', method: '', isNew: false, problem: null };
+  let m = text.match(/<script[^>]*\ssrc\s*=\s*["']([^"']+)["']/i);
+  let url = m ? m[1] : null;
+  if (!url) { const u = text.match(/https?:\/\/[^\s"'<>]+/i); if (u && /\.js(\?|$)|script|sdk/i.test(u[0])) url = u[0]; }
+  if (url && url.startsWith('//')) url = 'https:' + url;
+  try { if (url && new URL(url).protocol === 'https:' && url.length <= 400) r.scriptUrl = url; } catch (_) {}
+  if (!r.scriptUrl) { r.problem = 'Script URL (https://...) পাইনি। <script src="..."> লাইনসহ পুরো code পাঠান।'; return r; }
+  const showM = text.match(/\.(show[A-Za-z0-9_$]*)\s*\(/);
+  m = text.match(new RegExp('new\\s+(?:window\\.)?(' + PATH + ')\\s*\\(\\s*(\\{[\\s\\S]*?\\})\\s*\\)'));
+  if (m) { r.fn = m[1]; r.isNew = true; r.method = showM ? showM[1] : 'show'; r.args = parseJsObjectLiteral(m[2]); if (!r.args) r.problem = '{ ... } এর ভেতরের মানগুলো (key/ID) পড়তে পারিনি — শুধু লেখা/সংখ্যা থাকতে হবে, কোনো variable নয়।'; }
+  else {
+    m = text.match(new RegExp('(?:window\\.)?(' + PATH + '\\.init)\\s*\\(\\s*(\\{[\\s\\S]*?\\})\\s*\\)'));
+    if (m) { r.fn = m[1].replace(/^window\./, ''); r.method = showM ? showM[1] : 'show'; r.args = parseJsObjectLiteral(m[2]); if (!r.args) r.problem = '{ ... } এর ভেতরের মানগুলো (key/ID) পড়তে পারিনি — শুধু লেখা/সংখ্যা থাকতে হবে, কোনো variable নয়।'; }
+    else {
+      m = text.match(/(?:window\.)?(show[A-Za-z0-9_$]*)\s*\(\s*\)/i) || text.match(/window\.([A-Za-z_$][\w$]*)\s*\(\s*\)/);
+      if (m) r.fn = m[1];
+    }
+  }
+  if (!r.problem && (!r.fn || !CUSTOM_NET_FN_RE.test(r.fn))) r.problem = 'Ad দেখানোর code (যেমন window.showXxx() বা new Xxx({...}) বা Xxx.init({...})) খুঁজে পাইনি।';
+  return r;
+}
+const customNetCall = (c) => c.method ? `${c.isNew ? 'new ' : ''}${c.fn}(${c.args || ''}).${c.method}()` : `window.${c.fn}(${c.args || ''})`;
+bot.use(async (ctx, next) => {
+  const uid = ctx.from && ctx.from.id;
+  const st = uid && pendingCustomNet[uid];
+  if (!st || uid !== ADMIN_ID || !ctx.message || typeof ctx.message.text !== 'string') return next();
+  const text = ctx.message.text.trim();
+  const back = Markup.inlineKeyboard([[Markup.button.callback('📡 Ad Networks', 'adm_networks')]]);
+  if (text.startsWith('/')) { delete pendingCustomNet[uid]; return next(); }   // any command cancels
+  if (st.step === 'name') {
+    if (!text || text.length > 24) return ctx.reply('⚠️ নাম ১–২৪ অক্ষরের মধ্যে দিন (যেমন: GigaPub):');
+    st.name = text;
+    if (st.mode === 'paste') { st.step = 'snippet'; return ctx.reply('2️⃣ Network-এর dashboard/docs থেকে পাওয়া integration code-টা এখানে পুরো copy-paste করুন (<script> লাইন + ad দেখানোর code)।'); }
+    st.step = 'url';
+    return ctx.reply('2️⃣ Network-এর Script URL পাঠান (https:// দিয়ে শুরু হতে হবে)।\n\nউদাহরণ: https://ad.gigapub.tech/script?id=8675');
+  }
+  if (st.step === 'snippet') {
+    const r = parseAdSnippet(text);
+    if (r.problem) return ctx.reply('⚠️ ' + r.problem + '\n\nআবার পাঠান, অথবা /cancel দিয়ে বাদ দিন।');
+    st.scriptUrl = r.scriptUrl; st.fn = r.fn; st.args = r.args || ''; st.isNew = r.isNew; st.snipMethod = r.method || ''; st.step = 'confirm';
+    return ctx.reply(`✅ বুঝেছি — ঠিক আছে কিনা দেখুন:\n\n📛 নাম: ${st.name}\n🔗 Script: ${r.scriptUrl}\n⚙️ Ad call: ${customNetCall({ fn: r.fn, args: r.args, method: r.method, isNew: r.isNew })}\n\n⚠️ এই script আপনার সব user-এর Mini App-এ চালু হবে।`,
+      Markup.inlineKeyboard([[Markup.button.callback('✅ Save করুন', 'adm_netsave')], [Markup.button.callback('❌ Cancel', 'adm_networks')]]));
+  }
+  if (st.step === 'ablock') {
+    if (!/^[A-Za-z0-9_-]{1,40}$/.test(text)) return ctx.reply('⚠️ Block ID শুধু সংখ্যা/অক্ষর হতে পারে (যেমন: 12345 বা int-12345):');
+    return finishCustomNet(ctx, uid, { name: 'Adsgram', scriptUrl: 'https://sad.adsgram.ai/js/sad.min.js', fn: 'Adsgram.init', args: JSON.stringify({ blockId: text }), isNew: false }, 'show', back);
+  }
+  if (st.step === 'url') {
+    let ok = false; try { ok = new URL(text).protocol === 'https:' && text.length <= 400; } catch (_) {}
+    if (!ok) return ctx.reply('⚠️ সঠিক https:// URL দিন (শুধু URL, <script> ট্যাগ ছাড়া):');
+    st.scriptUrl = text; st.step = 'fn';
+    return ctx.reply('3️⃣ Ad দেখানোর function-এর নাম পাঠান (window. ছাড়া)।\n\nউদাহরণ: showGiga\n(এই function call করলে Promise ফেরত দিতে হবে — resolve = ad দেখা শেষ, reject = ad নেই/error)');
+  }
+  if (st.step === 'fn') {
+    let raw = text.replace(/\(.*\)\s*;?$/s, '').replace(/^window\./, '').trim();
+    let isNew = false;
+    if (/^new\s+/i.test(raw)) { isNew = true; raw = raw.replace(/^new\s+/i, '').replace(/^window\./, '').trim(); }
+    if (!CUSTOM_NET_FN_RE.test(raw) || raw.length > 80) return ctx.reply('⚠️ শুধু function-এর নাম দিন, যেমন: showGiga  (বা Adsgram.init, বা new LiteBitsAds)');
+    st.fn = raw; st.isNew = isNew; st.step = 'args';
+    return ctx.reply('4️⃣ Init/Constructor-এ কোনো parameter লাগলে JSON আকারে পাঠান, না লাগলে skip লিখুন।\n\nউদাহরণ (Adsgram): {"blockId":"আপনার-block-id"}\nউদাহরণ (সাধারণ function, যেমন showGiga): skip');
+  }
+  if (st.step === 'args') {
+    let args = '';
+    if (!/^skip$/i.test(text)) {
+      try { const a = JSON.parse(text); if (!a || typeof a !== 'object' || text.length > 400) throw new Error('bad'); args = JSON.stringify(a); }
+      catch (_) { return ctx.reply('⚠️ সঠিক JSON দিন, যেমন: {"blockId":"123"} — অথবা skip লিখুন।'); }
+    }
+    st.args = args;
+    if (!args && !st.isNew) return finishCustomNet(ctx, uid, st, '', back);
+    st.step = 'method';
+    return ctx.reply('5️⃣ Init করার পর Ad দেখানোর method-এর নাম কী? (Adsgram / LiteBits-এ: show)\n\nডিফল্ট "show" নিতে ok লিখুন:');
+  }
+  if (st.step === 'method') {
+    const m = /^ok$/i.test(text) ? 'show' : text.replace(/\(.*\)\s*;?$/s, '').trim();
+    if (!/^[A-Za-z_$][\w$]*$/.test(m)) return ctx.reply('⚠️ শুধু method-এর নাম দিন, যেমন: show (বা ok লিখুন)');
+    return finishCustomNet(ctx, uid, st, m, back);
+  }
+  return next();
+});
+function adNetworksView(s, custom = []) {
   const text = '📡 AD NETWORKS\n\n' +
     Object.keys(AD_SETTING_LABELS).map(k => `${s[k] ? '🟢 ON ' : '🔴 OFF'}  ${AD_SETTING_LABELS[k]}`).join('\n') +
+    (custom.length ? '\n\n🧩 Custom:\n' + custom.map(c => `${c.enabled !== false ? '🟢 ON ' : '🔴 OFF'}  ${c.name}  (${customNetCall(c)})`).join('\n') : '') +
     '\n\nবাটন চাপলে ON/OFF হবে। পরিবর্তন ~১ মিনিটের মধ্যে Mini App-এ কার্যকর হয়।\n' +
-    '⚠️ Monetag / OnClickA / GigaPub / RichAds (unlock ad) — অন্তত একটা চালু থাকতেই হবে।';
+    '⚠️ Monetag / OnClickA / GigaPub / LiteBits / RichAds (unlock ad) — অন্তত একটা চালু থাকতেই হবে।';
   const rows = Object.keys(AD_SETTING_LABELS).map(k => [Markup.button.callback(`${s[k] ? '🟢' : '🔴'} ${AD_SETTING_LABELS[k]}: ${s[k] ? 'ON' : 'OFF'}`, `adm_nettoggle_${k}`)]);
+  custom.forEach(c => rows.push([
+    Markup.button.callback(`${c.enabled !== false ? '🟢' : '🔴'} ${c.name}: ${c.enabled !== false ? 'ON' : 'OFF'}`, `adm_cnettoggle_${c.id}`),
+    Markup.button.callback('🗑 Delete', `adm_cnetdel_${c.id}`)
+  ]));
+  rows.push([Markup.button.callback('➕ নতুন Ad Network যোগ করুন', 'adm_netadd')]);
   rows.push([Markup.button.callback('⬅️ Back', 'adm_ads')]);
   return { text, keyboard: Markup.inlineKeyboard(rows) };
 }
@@ -2906,20 +3040,51 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   }
   if (action === 'user_search') { userSearchData[ctx.from.id] = { step: 'query' }; return ctx.reply('🔍 নাম, Username অথবা User ID লিখে পাঠান:'); }
   if (action === 'userlist') { adminUserCursor=null; adminUserPage=1; const snap=await db.collection('users').orderBy('createdAt','desc').limit(25).get(); if(snap.empty) return ctx.reply('📭 কোনো user নেই।'); adminUserCursor=snap.docs[snap.docs.length-1]; return sendUserPage(ctx,snap.docs,1); }
-  if (action === 'networks' || action.startsWith('nettoggle_')) {
+  if (action === 'netadd') {
+    delete pendingCustomNet[ctx.from.id];
+    return ctx.reply('➕ নতুন Ad Network যোগ\n\nকোন পদ্ধতিতে যোগ করবেন?\n\n📋 Code paste — network যে integration code দিয়েছে সেটা paste করলেই হবে (সবচেয়ে সহজ; বেশিরভাগ network-এর জন্য কাজ করে)\n🎯 Adsgram — শুধু Block ID দিলেই হবে\n✍️ Manual — script URL, function ইত্যাদি নিজে দেবেন\n\n⚠️ শুধু বিশ্বস্ত network-এর code দিন — এই script আপনার সব user-এর Mini App-এ চালু হবে।',
+      Markup.inlineKeyboard([[Markup.button.callback('📋 Code paste করে (সহজ)', 'adm_netadd_paste')], [Markup.button.callback('🎯 Adsgram (শুধু Block ID)', 'adm_netadd_adsgram')], [Markup.button.callback('✍️ Manual', 'adm_netadd_manual')], [Markup.button.callback('❌ Cancel', 'adm_networks')]]));
+  }
+  if (action === 'netadd_paste' || action === 'netadd_manual') {
+    pendingCustomNet[ctx.from.id] = { mode: action === 'netadd_paste' ? 'paste' : 'manual', step: 'name' };
+    return ctx.reply('1️⃣ Network-এর নাম লিখুন (যেমন: GigaPub):', Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'adm_networks')]]));
+  }
+  if (action === 'netadd_adsgram') {
+    pendingCustomNet[ctx.from.id] = { mode: 'adsgram', step: 'ablock' };
+    return ctx.reply('🎯 Adsgram\n\nআপনার Adsgram Block ID পাঠান (partner.adsgram.ai → আপনার app → Block ID; যেমন: 12345 বা int-12345):', Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'adm_networks')]]));
+  }
+  if (action === 'netsave') {
+    const st = pendingCustomNet[ctx.from.id];
+    if (!st || st.step !== 'confirm') return ctx.answerCbQuery('সময় শেষ — আবার "নতুন Ad Network যোগ" চাপুন', { show_alert: true }).catch(() => {});
+    return finishCustomNet(ctx, ctx.from.id, st, st.snipMethod, Markup.inlineKeyboard([[Markup.button.callback('📡 Ad Networks', 'adm_networks')]]));
+  }
+  if (action === 'networks' || action.startsWith('nettoggle_') || action.startsWith('cnettoggle_') || action.startsWith('cnetdel_')) {
+    delete pendingCustomNet[ctx.from.id];
     let s = await readAdSettings();
+    let custom = await readCustomNets();
+    const builtinOn = (st) => ['monetag', 'onclicka', 'gigapub', 'litebits', 'richads'].some(n => st[n]);
+    if (action.startsWith('cnettoggle_') || action.startsWith('cnetdel_')) {
+      const isDel = action.startsWith('cnetdel_');
+      const id = action.slice(isDel ? 'cnetdel_'.length : 'cnettoggle_'.length);
+      const next = isDel ? custom.filter(c => c.id !== id) : custom.map(c => c.id === id ? { ...c, enabled: c.enabled === false } : c);
+      if (!builtinOn(s) && !next.some(c => c.enabled !== false)) {
+        return ctx.answerCbQuery('⚠️ অন্তত একটা Ad Network চালু রাখতে হবে', { show_alert: true }).catch(() => {});
+      }
+      await writeCustomNets(next);
+      custom = next;
+    }
     if (action.startsWith('nettoggle_')) {
       const key = action.slice('nettoggle_'.length);
       if (!Object.prototype.hasOwnProperty.call(AD_SETTING_DEFAULTS, key)) return;
       const next = { ...s, [key]: !s[key] };
-      const unlockNets = ['monetag', 'onclicka', 'gigapub', 'richads'];
-      if (unlockNets.includes(key) && !unlockNets.some(n => next[n])) {
+      const unlockNets = ['monetag', 'onclicka', 'gigapub', 'litebits', 'richads'];
+      if (unlockNets.includes(key) && !unlockNets.some(n => next[n]) && !custom.some(c => c.enabled !== false)) {
         return ctx.answerCbQuery('⚠️ অন্তত একটা Ad Network চালু রাখতে হবে', { show_alert: true }).catch(() => {});
       }
       await db.collection('system').doc('adSettings').set({ [key]: next[key], updatedAt: Date.now() }, { merge: true });
       s = next;
     }
-    const view = adNetworksView(s);
+    const view = adNetworksView(s, custom);
     try { return await ctx.editMessageText(view.text, view.keyboard); }
     catch (e) { return ctx.reply(view.text, view.keyboard); }
   }
@@ -2939,7 +3104,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       `💵 আনুমানিক আজকের আয় (estimate): ${estTodayRevenue.toFixed(2)} ৳\n`;
     // Per-network breakdown (recorded by the Cloudflare Worker): how many ads
     // each network REALLY served and how often it failed (no fill / SDK error).
-    const nets = [['monetag', 'Monetag'], ['onclicka', 'OnClickA'], ['gigapub', 'GigaPub'], ['richads', 'RichAds']];
+    const nets = [['monetag', 'Monetag'], ['onclicka', 'OnClickA'], ['gigapub', 'GigaPub'], ['litebits', 'LiteBits'], ['richads', 'RichAds']].concat((await readCustomNets()).map(c => [c.id, c.name]));
     text += `\n📡 Ad Network (served / failed)\n` + nets.map(([k, label]) =>
       `• ${label}: ${Number(stats.byNetwork[k]) || 0} / ${Number(stats.fails[k]) || 0}` + (stats.lastFail[k] ? `\n   ⚠️ last error: ${String(stats.lastFail[k]).slice(0, 90)}` : '')
     ).join('\n') + '\n';
@@ -5157,7 +5322,7 @@ async function deliverUnlockedTopicInner(userId, topicId, userStateHint) {
 let adNetworkRotationCounter = 0;
 function nextAdNetwork() {
   const current = adNetworkRotationCounter++;
-  const list = ['monetag', 'onclicka', 'gigapub', 'richads'];
+  const list = ['monetag', 'onclicka', 'gigapub', 'litebits', 'richads'];
   return list[current % list.length];
 }
 
