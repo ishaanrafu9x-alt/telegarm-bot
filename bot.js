@@ -12,7 +12,11 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+// Render sometimes fails to reach api.telegram.org (empty "reason" on getMe). Prefer IPv4 + keep-alive
+// connections so that does not leave the bot dead.
+try { require('dns').setDefaultResultOrder('ipv4first'); } catch (_) {}
+const tgHttpsAgent = new (require('https').Agent)({ keepAlive: true, family: 4, timeout: 30000 });
+const bot = new Telegraf(process.env.BOT_TOKEN, { telegram: { agent: tgHttpsAgent } });
 
 // 🛡️ Telegram rejects an entire callback request with "inline keyboard
 // button text must be encoded in UTF-8" the moment ANY button's text
@@ -6666,27 +6670,29 @@ const BOT_LAUNCH_OPTIONS = {
   ]
 };
 
-function launchBot(isRetry) {
+let launchAttempt = 0;
+function launchBot() {
   launchFailed = false;
   bot.launch(BOT_LAUNCH_OPTIONS, () => markBotLaunched('onLaunch'))
     .then(() => markBotLaunched('promise resolved'))
     .catch(err => {
       launchFailed = true;
-      console.error(isRetry ? `❌ Retry failed: ${err.message}` : `❌ Bot start error: ${err.message}`);
-      if (!isRetry) {
-        // Polling failed হলে 5 সেকেন্ড পরে retry
-        setTimeout(() => {
-          console.log('🔄 Retrying bot launch...');
-          launchBot(true);
-        }, 5000);
-      }
+      launchAttempt++;
+      const detail = [err.code, err.type, err.errno, err.cause && (err.cause.code || err.cause.message)].filter(Boolean).join(' / ');
+      // Never give up: retry with back-off (5s, 10s, 20s, 40s, then every 60s) until Telegram is reachable.
+      const delay = Math.min(60000, 5000 * Math.pow(2, Math.min(launchAttempt - 1, 4)));
+      console.error(`❌ Bot start error (attempt ${launchAttempt}): ${err.message}${detail ? ' [' + detail + ']' : ''} — retrying in ${delay / 1000}s`);
+      setTimeout(() => {
+        console.log('🔄 Retrying bot launch...');
+        launchBot();
+      }, delay);
     });
   // Last resort: no launch error within 15s → polling is running.
   setTimeout(() => {
     if (!botLaunched && !launchFailed) markBotLaunched('fallback timer');
   }, 15000);
 }
-launchBot(false);
+launchBot();
 
 app.listen(process.env.PORT || 3000, () => {
   console.log(`🚀 Server running on port ${process.env.PORT || 3000}`);
