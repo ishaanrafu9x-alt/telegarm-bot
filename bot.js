@@ -243,7 +243,67 @@ async function safeDeleteMessage(chatId, messageId) {
 // ⚡ PERFORMANCE / CACHE
 // =============================================
 
-const THIRTY_MINUTES = 30 * 60 * 1000;
+let THIRTY_MINUTES = 30 * 60 * 1000; // now adjustable: Admin Panel -> Settings -> Delete/Unlock time
+
+// ============ ⚙️ APP SETTINGS (Admin Panel -> Settings) ============
+// One JSON string stored in system/adSettings.appJson (same doc the Worker already reads, so 0 extra reads).
+const APP_DEFAULTS = { announceOn: false, announce: '', maintOn: false, maint: '', hero: true, search: true, protect: true, unlockMin: 30, welcome: '' };
+let appSettings = { ...APP_DEFAULTS };
+function sanitizeApp(o) {
+  o = o && typeof o === 'object' ? o : {};
+  const c = { ...APP_DEFAULTS };
+  for (const k of ['announceOn', 'maintOn', 'hero', 'search', 'protect']) if (typeof o[k] === 'boolean') c[k] = o[k];
+  if (typeof o.announce === 'string') c.announce = o.announce.slice(0, 400);
+  if (typeof o.maint === 'string') c.maint = o.maint.slice(0, 400);
+  if (typeof o.welcome === 'string') c.welcome = o.welcome.slice(0, 800);
+  const m = Number(o.unlockMin);
+  if (Number.isFinite(m) && m >= 1 && m <= 1440) c.unlockMin = Math.round(m);
+  return c;
+}
+function applyAppSettings(o) {
+  appSettings = sanitizeApp(o);
+  THIRTY_MINUTES = appSettings.unlockMin * 60 * 1000;
+}
+async function loadAppSettings() {
+  const d = await db.collection('system').doc('adSettings').get();
+  const raw = d.exists ? d.data() : {};
+  let o = {};
+  try { o = JSON.parse(raw.appJson || '{}'); } catch (_) {}
+  applyAppSettings(o);
+  console.log('⚙️ app settings loaded:', JSON.stringify({ ...appSettings, welcome: appSettings.welcome ? '(set)' : '' }));
+}
+async function saveAppSettings(patch) {
+  const next = sanitizeApp({ ...appSettings, ...patch });
+  await db.collection('system').doc('adSettings').set({ appJson: JSON.stringify(next), updatedAt: Date.now() }, { merge: true });
+  applyAppSettings(next);
+  return next;
+}
+function minLabel(m) { return m % 60 === 0 && m >= 60 ? `${m / 60} ঘণ্টা` : `${m} মিনিট`; }
+function appSettingsView() {
+  const a = appSettings, st = (v) => (v ? '🟢 ON' : '🔴 OFF');
+  const cut = (t) => (t ? `"${safeTruncate(t, 60)}"` : '— (নেই)');
+  const text =
+    `⚙️ APP SETTINGS\n` +
+    `(কোড না বদলেই Mini App ও Bot নিয়ন্ত্রণ — ~১ মিনিটে কার্যকর)\n\n` +
+    `📢 Announcement Banner: ${st(a.announceOn)}\n    ${cut(a.announce)}\n` +
+    `🛠 Maintenance Mode: ${st(a.maintOn)}\n    ${cut(a.maint)}\n` +
+    `🔍 Search Box: ${st(a.search)}\n` +
+    `🖼 Hero Slider: ${st(a.hero)}\n` +
+    `🔒 Forward/Save Protect: ${st(a.protect)}\n` +
+    `⏱ Video Delete + Unlock সময়: ${minLabel(a.unlockMin)}\n` +
+    `👋 Welcome Message: ${a.welcome ? 'Custom' : 'Default'}`;
+  const T = (label, key) => Markup.button.callback(`${a[key] ? '🟢' : '🔴'} ${label}`, `adm_cfg_tgl_${key}`);
+  const keyboard = Markup.inlineKeyboard([
+    [T('Banner', 'announceOn'), Markup.button.callback('✏️ Banner লিখুন', 'adm_cfg_txt_announce')],
+    [T('Maintenance', 'maintOn'), Markup.button.callback('✏️ Maintenance বার্তা', 'adm_cfg_txt_maint')],
+    [T('Search', 'search'), T('Hero Slider', 'hero')],
+    [T('Protect Content', 'protect'), Markup.button.callback('⏱ Delete সময়', 'adm_cfg_min')],
+    [Markup.button.callback('👋 Welcome Message', 'adm_cfg_txt_welcome')],
+    [Markup.button.callback('⬅️ Back', 'adm_home')]
+  ]);
+  return { text, keyboard };
+}
+// ============ /APP SETTINGS ============
 // 🐛 FIX (THE main cost driver for accounts with lots of uploaded videos):
 // getTopicsCached() reads the ENTIRE `topics` collection on every refresh —
 // Firestore bills that as one read PER DOCUMENT, not one read per query. So
@@ -578,6 +638,8 @@ async function readCustomNets() {
 }
 async function writeCustomNets(list) {
   await db.collection('system').doc('customNetworks').set({ json: JSON.stringify(list), updatedAt: Date.now() });
+  // mirror into system/adSettings so the Worker needs only ONE Firestore read for all ad config
+  await db.collection('system').doc('adSettings').set({ customJson: JSON.stringify(list), updatedAt: Date.now() }, { merge: true });
 }
 const pendingCustomNet = {};
 async function finishCustomNet(ctx, uid, st, method, back) {
@@ -693,17 +755,122 @@ bot.use(async (ctx, next) => {
   }
   return next();
 });
-function adNetworksView(s, custom = []) {
+// ---------- ⚖️ Network weights (kon network koto ad pabe) + 🤖 Auto-pause (kharap network nijei OFF) ----------
+const UNLOCK_NET_KEYS = ['monetag', 'onclicka', 'gigapub', 'litebits', 'richads'];
+async function readNetWeights() {
+  try {
+    const d = await db.collection('system').doc('adWeights').get();
+    const o = d.exists ? JSON.parse(d.data().json || '{}') : {};
+    const out = {};
+    for (const k of Object.keys(o)) { const n = Number(o[k]); if (n >= 1 && n <= 9) out[k] = Math.round(n); }
+    return out;
+  } catch (e) { console.error('readNetWeights:', e.message); return {}; }
+}
+async function writeNetWeights(o) {
+  await db.collection('system').doc('adWeights').set({ json: JSON.stringify(o), updatedAt: Date.now() });
+  await db.collection('system').doc('adSettings').set({ weightsJson: JSON.stringify(o), updatedAt: Date.now() }, { merge: true });
+}
+// run once at start-up: make sure system/adSettings carries customJson + weightsJson (cheap: 1 read, writes only if missing)
+async function ensureAdConfigSynced() {
+  const d = await db.collection('system').doc('adSettings').get();
+  const x = d.exists ? d.data() : {};
+  if (typeof x.customJson === 'string' && typeof x.weightsJson === 'string') return;
+  const [c, w] = [await readCustomNets(), await readNetWeights()];
+  await db.collection('system').doc('adSettings').set({ customJson: JSON.stringify(c), weightsJson: JSON.stringify(w), updatedAt: Date.now() }, { merge: true });
+  console.log('🔧 ad config mirrored into system/adSettings');
+}
+function weightsView(s, custom, w) {
+  const items = UNLOCK_NET_KEYS.map(k => ({ id: k, label: AD_SETTING_LABELS[k], on: !!s[k] }))
+    .concat(custom.map(c => ({ id: c.id, label: c.name, on: c.enabled !== false })));
+  const sum = items.filter(i => i.on).reduce((n, i) => n + (w[i.id] || 1), 0) || 1;
+  const text = '⚖️ AD WEIGHT (কোন network কত ad পাবে)\n\n' +
+    items.map(i => `${i.on ? '🟢' : '🔴'} ${i.label}: ${w[i.id] || 1}` + (i.on ? `  →  ~${Math.round(((w[i.id] || 1) / sum) * 100)}%` : '  (OFF)')).join('\n') +
+    '\n\n➕/➖ চেপে সংখ্যা (১–৯) বদলান। সংখ্যা যত বেশি, ওই network তত বেশি ad পায়। ভাগ শুধু ON network-গুলোর মধ্যে হয়।\n' +
+    'পরিবর্তন ~১ মিনিটের মধ্যে Mini App-এ কার্যকর হয়।';
+  const rows = items.map(i => [
+    Markup.button.callback('➖', `adm_wtdn_${i.id}`),
+    Markup.button.callback(`${i.label}: ${w[i.id] || 1}`, 'adm_netwt'),
+    Markup.button.callback('➕', `adm_wtup_${i.id}`)
+  ]);
+  rows.push([Markup.button.callback('♻️ সব সমান করুন (১)', 'adm_wtreset')]);
+  rows.push([Markup.button.callback('⬅️ Back', 'adm_networks')]);
+  return { text, keyboard: Markup.inlineKeyboard(rows) };
+}
+
+// 🤖 Auto-pause: every 30 min compare served/failed counters (system/adStats) with the last snapshot. A network that
+// failed >= 70% of >= 30 attempts in that window is switched OFF (never the last ON network) and the admin is told.
+// After 3 hours it is switched back ON to be re-tested; if it is still bad it is paused again.
+const AUTOPAUSE_MIN_ATTEMPTS = 30, AUTOPAUSE_FAIL_RATE = 0.7, AUTOPAUSE_RETRY_MS = 3 * 3600 * 1000, AUTOPAUSE_MAX_WINDOW_MS = 6 * 3600 * 1000;
+async function readAutoPause() {
+  try {
+    const d = await db.collection('system').doc('adAuto').get();
+    const x = d.exists ? d.data() : {};
+    return { enabled: x.enabled !== false, snap: x.snap || {}, pausedAt: x.pausedAt || {} };
+  } catch (e) { console.error('readAutoPause:', e.message); return { enabled: true, snap: {}, pausedAt: {} }; }
+}
+async function writeAutoPause(o) {
+  await db.collection('system').doc('adAuto').set({ enabled: o.enabled !== false, snap: o.snap || {}, pausedAt: o.pausedAt || {}, updatedAt: Date.now() });
+}
+async function setNetEnabled(id, val, custom) {
+  if (/^c_[a-z0-9]{3,12}$/.test(id)) { await writeCustomNets(custom.map(c => c.id === id ? { ...c, enabled: val } : c)); return; }
+  await db.collection('system').doc('adSettings').set({ [id]: val, updatedAt: Date.now() }, { merge: true });
+}
+async function runAdAutoPause() {
+  const st = await readAutoPause();
+  if (!st.enabled) return;
+  const now = Date.now();
+  const [stats, s, custom] = [await getAdStats(), await readAdSettings(), await readCustomNets()];
+  const ids = UNLOCK_NET_KEYS.concat(custom.map(c => c.id));
+  const label = (id) => AD_SETTING_LABELS[id] || (custom.find(c => c.id === id) || {}).name || id;
+  const on = {};
+  for (const id of ids) on[id] = id.startsWith('c_') ? (custom.find(c => c.id === id) || {}).enabled !== false : !!s[id];
+  const cur = {};
+  for (const id of ids) cur[id] = { s: Number(stats.byNetwork[id]) || 0, f: Number(stats.fails[id]) || 0, at: now };
+  const snap = { ...st.snap }, pausedAt = { ...st.pausedAt };
+  const notes = [];
+  // 1) re-test networks that were auto-paused long ago (or drop the mark if the admin already turned them back ON)
+  for (const id of Object.keys(pausedAt)) {
+    if (!ids.includes(id) || on[id]) { delete pausedAt[id]; continue; }
+    if (now - Number(pausedAt[id]) >= AUTOPAUSE_RETRY_MS) {
+      await setNetEnabled(id, true, custom); on[id] = true; delete pausedAt[id]; snap[id] = cur[id];
+      notes.push(`▶️ ${label(id)} আবার ON করা হলো (নতুন করে পরীক্ষার জন্য)`);
+    }
+  }
+  // 2) judge the current window
+  for (const id of ids) {
+    const base = snap[id];
+    if (!base) { snap[id] = cur[id]; continue; }
+    let ds = cur[id].s - (Number(base.s) || 0), df = cur[id].f - (Number(base.f) || 0);
+    if (ds < 0 || df < 0) { snap[id] = cur[id]; continue; }          // counters were reset
+    const attempts = ds + df;
+    const othersOn = ids.filter(x => x !== id && on[x]).length;
+    if (on[id] && attempts >= AUTOPAUSE_MIN_ATTEMPTS && df / attempts >= AUTOPAUSE_FAIL_RATE && othersOn >= 1) {
+      await setNetEnabled(id, false, custom); on[id] = false; pausedAt[id] = now; snap[id] = cur[id];
+      notes.push(`⏸ ${label(id)} নিজে থেকে OFF হয়েছে — গত কিছুক্ষণে ${attempts}টির মধ্যে ${df}টি failed (${Math.round(df / attempts * 100)}%)। ৩ ঘণ্টা পর আবার পরীক্ষা হবে; চাইলে নিজেই ON করুন।`);
+      continue;
+    }
+    if (attempts >= AUTOPAUSE_MIN_ATTEMPTS || now - (Number(base.at) || 0) >= AUTOPAUSE_MAX_WINDOW_MS) snap[id] = cur[id];
+  }
+  if (JSON.stringify({ snap, pausedAt }) !== JSON.stringify({ snap: st.snap, pausedAt: st.pausedAt })) await writeAutoPause({ enabled: true, snap, pausedAt });
+  if (notes.length) {
+    try { await bot.telegram.sendMessage(ADMIN_ID, '🤖 AUTO-PAUSE\n\n' + notes.join('\n\n'), Markup.inlineKeyboard([[Markup.button.callback('📡 Ad Networks', 'adm_networks')]])); }
+    catch (e) { console.error('auto-pause notify failed:', e.message); }
+  }
+}
+function adNetworksView(s, custom = [], autoOn = true) {
   const text = '📡 AD NETWORKS\n\n' +
     Object.keys(AD_SETTING_LABELS).map(k => `${s[k] ? '🟢 ON ' : '🔴 OFF'}  ${AD_SETTING_LABELS[k]}`).join('\n') +
     (custom.length ? '\n\n🧩 Custom:\n' + custom.map(c => `${c.enabled !== false ? '🟢 ON ' : '🔴 OFF'}  ${c.name}  (${customNetCall(c)})`).join('\n') : '') +
     '\n\nবাটন চাপলে ON/OFF হবে। পরিবর্তন ~১ মিনিটের মধ্যে Mini App-এ কার্যকর হয়।\n' +
+    `🤖 Auto-pause ${autoOn ? 'ON — যে network-এর ৭০%+ ad failed হবে সেটা নিজেই OFF হবে (৩ ঘণ্টা পর আবার পরীক্ষা)' : 'OFF'}\n` +
     '⚠️ Monetag / OnClickA / GigaPub / LiteBits / RichAds (unlock ad) — অন্তত একটা চালু থাকতেই হবে।';
   const rows = Object.keys(AD_SETTING_LABELS).map(k => [Markup.button.callback(`${s[k] ? '🟢' : '🔴'} ${AD_SETTING_LABELS[k]}: ${s[k] ? 'ON' : 'OFF'}`, `adm_nettoggle_${k}`)]);
   custom.forEach(c => rows.push([
     Markup.button.callback(`${c.enabled !== false ? '🟢' : '🔴'} ${c.name}: ${c.enabled !== false ? 'ON' : 'OFF'}`, `adm_cnettoggle_${c.id}`),
     Markup.button.callback('🗑 Delete', `adm_cnetdel_${c.id}`)
   ]));
+  rows.push([Markup.button.callback('⚖️ Ad-এর ভাগ (Weight)', 'adm_netwt')]);
+  rows.push([Markup.button.callback(`🤖 Auto-pause: ${autoOn ? 'ON' : 'OFF'}`, 'adm_autopause')]);
   rows.push([Markup.button.callback('➕ নতুন Ad Network যোগ করুন', 'adm_netadd')]);
   rows.push([Markup.button.callback('⬅️ Back', 'adm_ads')]);
   return { text, keyboard: Markup.inlineKeyboard(rows) };
@@ -1448,7 +1615,7 @@ async function sendAdminPanel(ctx, edit = false) {
     [Markup.button.callback('📣 Broadcast', 'adm_broadcast'), Markup.button.callback('🔘 Post Buttons', 'adm_buttons')],
     [Markup.button.callback('💰 Revenue', 'adm_revenue'), Markup.button.callback('📦 Export Data', 'adm_export')],
     [Markup.button.callback('🕒 Scheduled Posts', 'adm_scheduled')],
-    [Markup.button.callback('👑 VIP Subscription', 'adm_vip')],
+    [Markup.button.callback('👑 VIP Subscription', 'adm_vip'), Markup.button.callback('⚙️ Settings', 'adm_cfg')],
     [Markup.button.callback('⌨️ Keyboard Show', 'adm_kb_show'), Markup.button.callback('❌ Keyboard Hide', 'adm_kb_hide')]
   ]);
   const chatId = ctx.chat && ctx.chat.id;
@@ -1480,7 +1647,7 @@ const ADMIN_KB_BUTTONS = [
   ['👥 Users', 'users'], ['📺 Ads', 'ads'],
   ['📣 Broadcast', 'broadcast'], ['🔘 Post Buttons', 'buttons'],
   ['💰 Revenue', 'revenue'], ['📦 Export Data', 'export'],
-  ['🕒 Scheduled Posts', 'scheduled'], ['👑 VIP Subscription', 'vip'],
+  ['🕒 Scheduled Posts', 'scheduled'], ['👑 VIP Subscription', 'vip'], ['⚙️ Settings', 'cfg'],
   ['🏠 Admin Panel', 'home'], ['❌ Keyboard Hide', 'kb_hide']
 ];
 function adminReplyKeyboard() {
@@ -1777,7 +1944,7 @@ bot.start(async (ctx) => {
     }
 
     return ctx.reply(
-      '👋 স্বাগতম! আপনার ভিডিও দেখতে নিচের বাটনে ক্লিক করুন।',
+      appSettings.welcome || '👋 স্বাগতম! আপনার ভিডিও দেখতে নিচের বাটনে ক্লিক করুন।',
       Markup.inlineKeyboard([
         Markup.button.webApp('🚀 Open App', MINI_APP_URL)
       ])
@@ -3058,10 +3225,29 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
     if (!st || st.step !== 'confirm') return ctx.answerCbQuery('সময় শেষ — আবার "নতুন Ad Network যোগ" চাপুন', { show_alert: true }).catch(() => {});
     return finishCustomNet(ctx, ctx.from.id, st, st.snipMethod, Markup.inlineKeyboard([[Markup.button.callback('📡 Ad Networks', 'adm_networks')]]));
   }
-  if (action === 'networks' || action.startsWith('nettoggle_') || action.startsWith('cnettoggle_') || action.startsWith('cnetdel_')) {
+  if (action === 'netwt' || action === 'wtreset' || action.startsWith('wtup_') || action.startsWith('wtdn_')) {
+    const s0 = await readAdSettings();
+    const custom0 = await readCustomNets();
+    let w = await readNetWeights();
+    const validIds = UNLOCK_NET_KEYS.concat(custom0.map(c => c.id));
+    if (action === 'wtreset') w = {};
+    else if (action.startsWith('wtup_') || action.startsWith('wtdn_')) {
+      const up = action.startsWith('wtup_');
+      const id = action.slice(5);
+      if (!validIds.includes(id)) return;
+      w[id] = Math.max(1, Math.min(9, (w[id] || 1) + (up ? 1 : -1)));
+    }
+    if (action !== 'netwt') { for (const k of Object.keys(w)) if (!validIds.includes(k)) delete w[k]; await writeNetWeights(w); }
+    const wv = weightsView(s0, custom0, w);
+    try { return await ctx.editMessageText(wv.text, wv.keyboard); }
+    catch (e) { return ctx.reply(wv.text, wv.keyboard); }
+  }
+  if (action === 'networks' || action === 'autopause' || action.startsWith('nettoggle_') || action.startsWith('cnettoggle_') || action.startsWith('cnetdel_')) {
     delete pendingCustomNet[ctx.from.id];
     let s = await readAdSettings();
     let custom = await readCustomNets();
+    const auto = await readAutoPause();
+    if (action === 'autopause') { auto.enabled = !auto.enabled; await writeAutoPause(auto); }
     const builtinOn = (st) => ['monetag', 'onclicka', 'gigapub', 'litebits', 'richads'].some(n => st[n]);
     if (action.startsWith('cnettoggle_') || action.startsWith('cnetdel_')) {
       const isDel = action.startsWith('cnetdel_');
@@ -3084,9 +3270,49 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       await db.collection('system').doc('adSettings').set({ [key]: next[key], updatedAt: Date.now() }, { merge: true });
       s = next;
     }
-    const view = adNetworksView(s, custom);
+    const view = adNetworksView(s, custom, auto.enabled);
     try { return await ctx.editMessageText(view.text, view.keyboard); }
     catch (e) { return ctx.reply(view.text, view.keyboard); }
+  }
+  if (action === 'cfg' || action.startsWith('cfg_')) {
+    const showCfg = async () => {
+      const v = appSettingsView();
+      try { return await ctx.editMessageText(v.text, v.keyboard); }
+      catch (e) { if (/not modified/i.test(e && e.message)) return; return ctx.reply(v.text, v.keyboard); }
+    };
+    if (action === 'cfg') return showCfg();
+    if (action.startsWith('cfg_tgl_')) {
+      const key = action.slice('cfg_tgl_'.length);
+      if (!['announceOn', 'maintOn', 'search', 'hero', 'protect'].includes(key)) return;
+      if (key === 'announceOn' && !appSettings.announceOn && !appSettings.announce) {
+        return ctx.answerCbQuery('আগে "✏️ Banner লিখুন" দিয়ে লেখা সেট করুন', { show_alert: true }).catch(() => {});
+      }
+      await saveAppSettings({ [key]: !appSettings[key] });
+      return showCfg();
+    }
+    if (action.startsWith('cfg_txt_')) {
+      const key = action.slice('cfg_txt_'.length);
+      const names = { announce: 'Announcement Banner-এর লেখা', maint: 'Maintenance বার্তা', welcome: '/start Welcome Message' };
+      if (!names[key]) return;
+      updateAdsData[ctx.from.id] = { step: 'cfg_' + key };
+      const cur = appSettings[key] ? `\n\nবর্তমান:\n${appSettings[key]}` : '';
+      return ctx.reply(`✏️ ${names[key]} পাঠান।\n(মুছে ডিফল্টে ফিরতে "-" লিখুন, বাতিল করতে /cancel)${cur}`);
+    }
+    if (action === 'cfg_min') {
+      const cur = appSettings.unlockMin;
+      const b = (m) => Markup.button.callback(`${cur === m ? '✅ ' : ''}${minLabel(m)}`, `adm_cfg_minset_${m}`);
+      return ctx.reply(`⏱ ভিডিও ডিলিট + Unlock সময়\nএখন: ${minLabel(cur)}\n\n(User ভিডিও দেখার পর এত সময় পরে ভিডিও মুছে যাবে এবং unlock-ও শেষ হবে)`,
+        Markup.inlineKeyboard([[b(10), b(30), b(60)], [b(120), b(360), b(1440)], [Markup.button.callback('✏️ নিজে লিখুন (মিনিট)', 'adm_cfg_minset_custom')], [Markup.button.callback('⬅️ Back', 'adm_cfg')]]));
+    }
+    if (action.startsWith('cfg_minset_')) {
+      const v = action.slice('cfg_minset_'.length);
+      if (v === 'custom') { updateAdsData[ctx.from.id] = { step: 'cfg_unlockMin' }; return ctx.reply('⏱ কত মিনিট? (১ - ১৪৪০ এর মধ্যে সংখ্যা লিখুন):'); }
+      const m = Number(v);
+      if (!Number.isInteger(m) || m < 1 || m > 1440) return;
+      await saveAppSettings({ unlockMin: m });
+      return showCfg();
+    }
+    return;
   }
   if (action === 'ads') return ctx.reply('📺 Ads Management', Markup.inlineKeyboard([[Markup.button.callback('📡 Ad Networks (ON/OFF)','adm_networks')],[Markup.button.callback('🎯 Set Video Ads','adm_set_ads')],[Markup.button.callback('🎯 Daily Limit','adm_daily_limit')],[Markup.button.callback('⬅️ Back','adm_home')]]));
   if (action === 'set_ads') { updateAdsData[ctx.from.id]={step:'topicId'}; return ctx.reply('🎯 Video/Topic ID পাঠান:'); }
@@ -4511,6 +4737,27 @@ bot.on('text', async (ctx) => {
     }
   }
 
+  if (userId === ADMIN_ID && updateAdsData[userId] && String(updateAdsData[userId].step || '').startsWith('cfg_')) {
+    const key = updateAdsData[userId].step.slice(4);
+    const backKb = { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('⚙️ Settings', 'adm_cfg')]]).reply_markup };
+    if (key === 'unlockMin') {
+      const m = Number(text);
+      if (!Number.isInteger(m) || m < 1 || m > 1440) return ctx.reply('❌ ১ থেকে ১৪৪০ এর মধ্যে পূর্ণ সংখ্যা লিখুন।');
+      delete updateAdsData[userId];
+      await saveAppSettings({ unlockMin: m });
+      return ctx.reply(`✅ এখন থেকে ভিডিও ${minLabel(m)} পর ডিলিট হবে এবং unlock ${minLabel(m)} থাকবে।`, backKb);
+    }
+    if (['announce', 'maint', 'welcome'].includes(key)) {
+      delete updateAdsData[userId];
+      const clear = text === '-';
+      const patch = { [key]: clear ? '' : text };
+      if (key === 'announce' && clear) patch.announceOn = false;
+      if (key === 'announce' && !clear) patch.announceOn = true;
+      await saveAppSettings(patch);
+      return ctx.reply(clear ? '✅ মুছে ডিফল্টে ফেরানো হয়েছে।' : (key === 'announce' ? '✅ Banner সেট হয়েছে এবং ON করা হয়েছে।' : '✅ সংরক্ষণ করা হয়েছে।'), backKb);
+    }
+  }
+
   if (updateAdsData[userId] && updateAdsData[userId].step === 'dailyLimit') {
     const value = Number(text);
     if (!Number.isInteger(value) || value < 1 || value > 1000) return ctx.reply('❌ Limit 1-1000 এর মধ্যে হতে হবে।');
@@ -5258,8 +5505,8 @@ async function deliverUnlockedTopicInner(userId, topicId, userStateHint) {
       if (alreadySent) { anyDelivered = true; continue; }
       // safeSendVideo uses 403-tolerant wrapper
       const sentMsg = await safeSendVideo(userId, videoId, {
-        protect_content: true,
-        caption: '⏳ এই ভিডিও ৩০ মিনিট পর ডিলিট হয়ে যাবে।'
+        protect_content: !!appSettings.protect,
+        caption: `⏳ এই ভিডিও ${appSettings.unlockMin} মিনিট পর ডিলিট হয়ে যাবে।`
       });
       if (sentMsg) {
         anyDelivered = true;
@@ -5966,6 +6213,12 @@ function schedulePostTimer(docId, delayMs) {
 // a full restart. Runs once every 30 minutes, not every minute, to keep
 // Firestore reads minimal (this is a deliberate trade-off: worst case a
 // missed post fires up to ~30 minutes late instead of never).
+// 🤖 Ad-network auto-pause check (every 30 min: 4 small reads, a write only when something changed)
+cron.schedule('*/30 * * * *', async () => {
+  if (!botLaunched) return;
+  try { await runAdAutoPause(); } catch (e) { console.error('auto-pause error:', e.message); }
+});
+
 cron.schedule('*/30 * * * *', async () => {
   if (!botLaunched) return; // not the live poller in this overlap window — skip
   try {
@@ -6440,6 +6693,8 @@ app.listen(process.env.PORT || 3000, () => {
   // Warm the topics cache immediately so the very first user of a fresh
   // deploy/restart doesn't have to wait on a cold Firestore read.
   getTopicsCached().then(() => ensureTopicsIndex()).catch(() => {});
+  ensureAdConfigSynced().catch(e => console.error('ensureAdConfigSynced:', e.message));
+  loadAppSettings().catch(e => console.error('loadAppSettings:', e.message));
 });
 
 // Graceful shutdown — Render restart-এ ঝুলে না যায়
