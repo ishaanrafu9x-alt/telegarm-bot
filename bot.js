@@ -251,7 +251,7 @@ let THIRTY_MINUTES = 30 * 60 * 1000; // now adjustable: Admin Panel -> Settings 
 
 // ============ ⚙️ APP SETTINGS (Admin Panel -> Settings) ============
 // One JSON string stored in system/adSettings.appJson (same doc the Worker already reads, so 0 extra reads).
-const APP_DEFAULTS = { announceOn: false, announce: '', maintOn: false, maint: '', hero: true, search: true, protect: true, unlockMin: 30, welcome: '' };
+const APP_DEFAULTS = { announceOn: false, announce: '', maintOn: false, maint: '', hero: true, search: true, protect: true, unlockMin: 30, welcome: '', vipUrl: '' };
 let appSettings = { ...APP_DEFAULTS };
 function sanitizeApp(o) {
   o = o && typeof o === 'object' ? o : {};
@@ -260,6 +260,7 @@ function sanitizeApp(o) {
   if (typeof o.announce === 'string') c.announce = o.announce.slice(0, 400);
   if (typeof o.maint === 'string') c.maint = o.maint.slice(0, 400);
   if (typeof o.welcome === 'string') c.welcome = o.welcome.slice(0, 800);
+  if (typeof o.vipUrl === 'string' && /^https:\/\/(t|telegram)\.me\/[\w\-\/?=&.]{2,120}$/i.test(o.vipUrl.trim())) c.vipUrl = o.vipUrl.trim();
   const m = Number(o.unlockMin);
   if (Number.isFinite(m) && m >= 1 && m <= 1440) c.unlockMin = Math.round(m);
   return c;
@@ -295,14 +296,15 @@ function appSettingsView() {
     `🖼 Hero Slider: ${st(a.hero)}\n` +
     `🔒 Forward/Save Protect: ${st(a.protect)}\n` +
     `⏱ Video Delete + Unlock সময়: ${minLabel(a.unlockMin)}\n` +
-    `👋 Welcome Message: ${a.welcome ? 'Custom' : 'Default'}`;
+    `👋 Welcome Message: ${a.welcome ? 'Custom' : 'Default'}\n` +
+    `👑 VIP কেনার লিংক: ${a.vipUrl || '— (নেই, বাটন লুকানো)'}`;
   const T = (label, key) => Markup.button.callback(`${a[key] ? '🟢' : '🔴'} ${label}`, `adm_cfg_tgl_${key}`);
   const keyboard = Markup.inlineKeyboard([
     [T('Banner', 'announceOn'), Markup.button.callback('✏️ Banner লিখুন', 'adm_cfg_txt_announce')],
     [T('Maintenance', 'maintOn'), Markup.button.callback('✏️ Maintenance বার্তা', 'adm_cfg_txt_maint')],
     [T('Search', 'search'), T('Hero Slider', 'hero')],
     [T('Protect Content', 'protect'), Markup.button.callback('⏱ Delete সময়', 'adm_cfg_min')],
-    [Markup.button.callback('👋 Welcome Message', 'adm_cfg_txt_welcome')],
+    [Markup.button.callback('👋 Welcome Message', 'adm_cfg_txt_welcome'), Markup.button.callback('👑 VIP লিংক', 'adm_cfg_txt_vipUrl')],
     [Markup.button.callback('⬅️ Back', 'adm_home')]
   ]);
   return { text, keyboard };
@@ -1618,7 +1620,7 @@ async function sendAdminPanel(ctx, edit = false) {
     [Markup.button.callback('👥 Users', 'adm_users'), Markup.button.callback('📺 Ads', 'adm_ads')],
     [Markup.button.callback('📣 Broadcast', 'adm_broadcast'), Markup.button.callback('🔘 Post Buttons', 'adm_buttons')],
     [Markup.button.callback('💰 Revenue', 'adm_revenue'), Markup.button.callback('📦 Export Data', 'adm_export')],
-    [Markup.button.callback('🕒 Scheduled Posts', 'adm_scheduled')],
+    [Markup.button.callback('🕒 Scheduled Posts', 'adm_scheduled'), Markup.button.callback('📈 Reports', 'adm_reports')],
     [Markup.button.callback('👑 VIP Subscription', 'adm_vip'), Markup.button.callback('⚙️ Settings', 'adm_cfg')],
     [Markup.button.callback('⌨️ Keyboard Show', 'adm_kb_show'), Markup.button.callback('❌ Keyboard Hide', 'adm_kb_hide')]
   ]);
@@ -1651,7 +1653,7 @@ const ADMIN_KB_BUTTONS = [
   ['👥 Users', 'users'], ['📺 Ads', 'ads'],
   ['📣 Broadcast', 'broadcast'], ['🔘 Post Buttons', 'buttons'],
   ['💰 Revenue', 'revenue'], ['📦 Export Data', 'export'],
-  ['🕒 Scheduled Posts', 'scheduled'], ['👑 VIP Subscription', 'vip'], ['⚙️ Settings', 'cfg'],
+  ['🕒 Scheduled Posts', 'scheduled'], ['👑 VIP Subscription', 'vip'], ['⚙️ Settings', 'cfg'], ['📈 Reports', 'reports'],
   ['🏠 Admin Panel', 'home'], ['❌ Keyboard Hide', 'kb_hide']
 ];
 function adminReplyKeyboard() {
@@ -3296,7 +3298,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
     }
     if (action.startsWith('cfg_txt_')) {
       const key = action.slice('cfg_txt_'.length);
-      const names = { announce: 'Announcement Banner-এর লেখা', maint: 'Maintenance বার্তা', welcome: '/start Welcome Message' };
+      const names = { announce: 'Announcement Banner-এর লেখা', maint: 'Maintenance বার্তা', welcome: '/start Welcome Message', vipUrl: 'Payment Bot-এর লিংক (যেমন https://t.me/YourPaymentBot)' };
       if (!names[key]) return;
       updateAdsData[ctx.from.id] = { step: 'cfg_' + key };
       const cur = appSettings[key] ? `\n\nবর্তমান:\n${appSettings[key]}` : '';
@@ -3321,6 +3323,56 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   if (action === 'ads') return ctx.reply('📺 Ads Management', Markup.inlineKeyboard([[Markup.button.callback('📡 Ad Networks (ON/OFF)','adm_networks')],[Markup.button.callback('🎯 Set Video Ads','adm_set_ads')],[Markup.button.callback('🎯 Daily Limit','adm_daily_limit')],[Markup.button.callback('⬅️ Back','adm_home')]]));
   if (action === 'set_ads') { updateAdsData[ctx.from.id]={step:'topicId'}; return ctx.reply('🎯 Video/Topic ID পাঠান:'); }
   if (action === 'daily_limit') { const current=await getDailyAdLimit(); updateAdsData[ctx.from.id]={step:'dailyLimit'}; return ctx.reply(`📊 বর্তমান Daily Ad Limit: ${current}টি\n\nনতুন limit লিখুন:`); }
+  if (action === 'reports' || action === 'rep_week' || action === 'rep_top' || action === 'rep_top_all' || action === 'rep_dead') {
+    const back = [Markup.button.callback('⬅️ Reports', 'adm_reports')];
+    if (action === 'reports') {
+      return ctx.reply('📈 REPORTS\n\nকোড/Firebase না খুলেই ব্যবসার অবস্থা দেখুন:', Markup.inlineKeyboard([
+        [Markup.button.callback('📊 ৭ দিনের Ad ও আয়', 'adm_rep_week')],
+        [Markup.button.callback('🏆 Top Video (৭ দিন)', 'adm_rep_top'), Markup.button.callback('🏆 Top (সব সময়)', 'adm_rep_top_all')],
+        [Markup.button.callback('💤 কেউ দেখছে না এমন Video', 'adm_rep_dead')],
+        [Markup.button.callback('⬅️ Back', 'adm_home')]
+      ]));
+    }
+    if (action === 'rep_week') {
+      try { await Promise.all([flushAdViews(), flushUnlockStats()]); } catch (_) {}
+      const [doc, cpm] = await Promise.all([db.collection('system').doc('adStats').get(), getAdCpm()]);
+      const by = (doc.exists && doc.data().adViewsByDate) || {};
+      const days = [];
+      for (let i = 6; i >= 0; i--) {
+        const key = getDhakaDateKey(new Date(Date.now() - i * 86400000));
+        days.push({ key, v: Number(by[key]) || 0 });
+      }
+      const max = Math.max(1, ...days.map(d => d.v));
+      const total = days.reduce((n, d) => n + d.v, 0);
+      const rows = days.map(d => {
+        const bar = '█'.repeat(Math.round((d.v / max) * 10)) || '▏';
+        return `${d.key.slice(5)}  ${bar} ${d.v} (${((d.v / 1000) * cpm).toFixed(1)}৳)`;
+      }).join('\n');
+      const best = days.reduce((a, b) => (b.v > a.v ? b : a), days[0]);
+      const text = `📊 ৭ দিনের Ad ও আয়\n\n<pre>${rows}</pre>\n` +
+        `📺 মোট Ad View: ${total.toLocaleString('en-US')}\n` +
+        `💵 আনুমানিক আয়: ${((total / 1000) * cpm).toFixed(2)} ৳ (CPM ${cpm} ৳)\n` +
+        `📅 গড় প্রতিদিন: ${Math.round(total / 7).toLocaleString('en-US')} view\n` +
+        `🔥 সেরা দিন: ${best.key.slice(5)} (${best.v})`;
+      return ctx.reply(text, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([back]).reply_markup });
+    }
+    const topics = await getTopicsCached();
+    const title = (t) => escapeHtml(safeTruncate(String(t.title || 'নামবিহীন'), 40));
+    if (action === 'rep_top' || action === 'rep_top_all') {
+      const wk = action === 'rep_top';
+      const score = (t) => (wk ? weekUnlocksOf(t) : (Number(t.unlockCount) || 0));
+      const list = topics.map(t => ({ t, n: score(t) })).filter(x => x.n > 0).sort((a, b) => b.n - a.n).slice(0, 10);
+      if (!list.length) return ctx.reply('📭 এখনো কোনো unlock ডেটা নেই।', { reply_markup: Markup.inlineKeyboard([back]).reply_markup });
+      const lines = list.map((x, i) => `${i + 1}. <b>${title(x.t)}</b>\n    🔓 ${x.n} unlock · 🆔 <code>${escapeHtml(x.t.id)}</code>`);
+      return ctx.reply(`🏆 TOP VIDEO (${wk ? 'শেষ ৭ দিন' : 'সব সময়'})\n\n${lines.join('\n')}`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([back]).reply_markup });
+    }
+    // rep_dead: older than 3 days and never unlocked
+    const cut = Date.now() - 3 * 86400000;
+    const dead = topics.filter(t => (Number(t.unlockCount) || 0) === 0 && (new Date(t.createdAt || 0).getTime() || 0) < cut);
+    if (!dead.length) return ctx.reply('✅ সব video-ই কেউ না কেউ দেখেছে।', { reply_markup: Markup.inlineKeyboard([back]).reply_markup });
+    const lines = dead.slice(0, 15).map((t, i) => `${i + 1}. ${title(t)}\n    🆔 <code>${escapeHtml(t.id)}</code>`);
+    return ctx.reply(`💤 কেউ দেখেনি (৩ দিনের পুরনো) — মোট ${dead.length}টি\n\n${lines.join('\n')}${dead.length > 15 ? '\n…' : ''}\n\nটিপ: thumbnail/title বদলান অথবা মুছে দিন।`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([back]).reply_markup });
+  }
   if (action === 'revenue') {
     try { await Promise.all([flushAdViews(), flushUnlockStats()]); } catch (_) {}
     const [stats, cpm] = await Promise.all([getAdStats(), getAdCpm()]);
@@ -4751,7 +4803,8 @@ bot.on('text', async (ctx) => {
       await saveAppSettings({ unlockMin: m });
       return ctx.reply(`✅ এখন থেকে ভিডিও ${minLabel(m)} পর ডিলিট হবে এবং unlock ${minLabel(m)} থাকবে।`, backKb);
     }
-    if (['announce', 'maint', 'welcome'].includes(key)) {
+    if (['announce', 'maint', 'welcome', 'vipUrl'].includes(key)) {
+      if (key === 'vipUrl' && text !== '-' && !/^https:\/\/(t|telegram)\.me\/[\w\-\/?=&.]{2,120}$/i.test(text.trim())) return ctx.reply('❌ লিংক https://t.me/... আকারে দিন (বা মুছতে "-" লিখুন)।');
       delete updateAdsData[userId];
       const clear = text === '-';
       const patch = { [key]: clear ? '' : text };
@@ -6042,15 +6095,46 @@ async function listVipSubscriptions(ctx) {
     if (snap.empty) {
       return ctx.reply('📋 এই মুহূর্তে কোনো active VIP নেই।', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'adm_vip')]]));
     }
+    // Name sources, best first: main-bot fields -> fields the Payment bot left on approve -> paymentBotUsers doc.
+    const pick = (d) => ({
+      first: d.firstName || d.first_name || d.vipName || '',
+      user: d.username || d.vipUsername || '',
+      payer: d.vipPayerName || ''
+    });
+    const missing = snap.docs.filter(doc => { const p = pick(doc.data()); return !p.first && !p.user && !p.payer; });
+    const fallback = new Map();
+    if (missing.length) {
+      try {
+        const refs = missing.slice(0, 100).map(doc => db.collection('paymentBotUsers').doc(doc.id));
+        const docs = await db.getAll(...refs);
+        docs.forEach(x => { if (x.exists) fallback.set(x.id, x.data()); });
+      } catch (e) { console.error('VIP name fallback failed:', e.message); }
+    }
     const lines = snap.docs.map(doc => {
       const d = doc.data();
+      let p = pick(d);
+      const f = fallback.get(doc.id);
+      if (f) p = { first: p.first || f.firstName || '', user: p.user || f.username || '', payer: p.payer || f.payerName || '' };
       const expiresAt = Number(d.subscriptionExpiresAt);
       const daysLeft = Math.max(1, Math.ceil((expiresAt - now) / (24 * 60 * 60 * 1000)));
-      const name = d.username ? '@' + d.username : (d.firstName || '');
       const dateStr = new Date(expiresAt).toLocaleString('bn-BD', { timeZone: 'Asia/Dhaka', dateStyle: 'medium' });
-      return `👤 <code>${doc.id}</code> ${name}\n   ⏳ বাকি: ${daysLeft} দিন (শেষ: ${dateStr})`;
+      const shown = escapeHtml(p.first || p.payer || 'নাম নেই');
+      const who = `<a href="tg://user?id=${doc.id}">${shown}</a>${p.user ? ' (@' + escapeHtml(p.user) + ')' : ''}`;
+      const payerLine = p.payer && p.payer !== p.first ? `\n   ✍️ পেমেন্টের নাম: ${escapeHtml(p.payer)}` : '';
+      const buyLine = d.vipLastPrice ? `\n   💳 শেষ পেমেন্ট: ${escapeHtml(String(d.vipLastPrice))}৳${d.vipLastMethod ? ' (' + escapeHtml(d.vipLastMethod) + ')' : ''}` : '';
+      return `👤 ${who}\n   🆔 <code>${doc.id}</code>${payerLine}${buyLine}\n   ⏳ বাকি: ${daysLeft} দিন (শেষ: ${dateStr})`;
     });
-    return ctx.reply(`📋 VIP LIST (${snap.size} জন)\n\n${lines.join('\n\n')}`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'adm_vip')]]) });
+    const header = `📋 VIP LIST (${snap.size} জন)\n\n`;
+    const kb = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'adm_vip')]]);
+    // Telegram's message limit is 4096 chars: send in chunks, keyboard on the last one.
+    const chunks = []; let cur = header;
+    for (const l of lines) { if ((cur + l + '\n\n').length > 3800) { chunks.push(cur); cur = ''; } cur += l + '\n\n'; }
+    if (cur) chunks.push(cur);
+    for (let k = 0; k < chunks.length; k++) {
+      const extra = { parse_mode: 'HTML', disable_web_page_preview: true };
+      if (k === chunks.length - 1) extra.reply_markup = kb.reply_markup;
+      if (k === 0) await ctx.reply(chunks[k], extra); else await ctx.telegram.sendMessage(ctx.chat.id, chunks[k], extra);
+    }
   } catch (error) {
     console.error('❌ listVipSubscriptions error:', error.message);
     return ctx.reply('❌ VIP list আনতে সমস্যা হয়েছে: ' + error.message);
