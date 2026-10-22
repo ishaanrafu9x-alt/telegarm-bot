@@ -251,7 +251,7 @@ let THIRTY_MINUTES = 30 * 60 * 1000; // now adjustable: Admin Panel -> Settings 
 
 // ============ ⚙️ APP SETTINGS (Admin Panel -> Settings) ============
 // One JSON string stored in system/adSettings.appJson (same doc the Worker already reads, so 0 extra reads).
-const APP_DEFAULTS = { announceOn: false, announce: '', maintOn: false, maint: '', hero: true, search: true, protect: true, unlockMin: 30, welcome: '', vipUrl: '' };
+const APP_DEFAULTS = { announceOn: false, announce: '', maintOn: false, maint: '', hero: true, search: true, protect: true, unlockMin: 30, welcome: '', vipUrl: '', offerOn: false, offerTitle: '', offerText: '', offerCode: '', offerUntil: 0, autoDigest: false };
 let appSettings = { ...APP_DEFAULTS };
 function sanitizeApp(o) {
   o = o && typeof o === 'object' ? o : {};
@@ -260,6 +260,11 @@ function sanitizeApp(o) {
   if (typeof o.announce === 'string') c.announce = o.announce.slice(0, 400);
   if (typeof o.maint === 'string') c.maint = o.maint.slice(0, 400);
   if (typeof o.welcome === 'string') c.welcome = o.welcome.slice(0, 800);
+  if (typeof o.offerOn === 'boolean') c.offerOn = o.offerOn;
+  if (typeof o.autoDigest === 'boolean') c.autoDigest = o.autoDigest;
+  for (const k of ['offerTitle', 'offerText', 'offerCode']) if (typeof o[k] === 'string') c[k] = o[k].slice(0, k === 'offerText' ? 300 : 60);
+  const ou = Number(o.offerUntil);
+  if (Number.isFinite(ou) && ou >= 0) c.offerUntil = ou;
   if (typeof o.vipUrl === 'string' && /^https:\/\/(t|telegram)\.me\/[\w\-\/?=&.]{2,120}$/i.test(o.vipUrl.trim())) c.vipUrl = o.vipUrl.trim();
   const m = Number(o.unlockMin);
   if (Number.isFinite(m) && m >= 1 && m <= 1440) c.unlockMin = Math.round(m);
@@ -297,7 +302,9 @@ function appSettingsView() {
     `🔒 Forward/Save Protect: ${st(a.protect)}\n` +
     `⏱ Video Delete + Unlock সময়: ${minLabel(a.unlockMin)}\n` +
     `👋 Welcome Message: ${a.welcome ? 'Custom' : 'Default'}\n` +
-    `👑 VIP কেনার লিংক: ${a.vipUrl || '— (নেই, বাটন লুকানো)'}`;
+    `👑 VIP কেনার লিংক: ${a.vipUrl || '— (নেই, বাটন লুকানো)'}\n` +
+    `🎁 Offer Card: ${st(a.offerOn)}${a.offerTitle ? '\n    "' + safeTruncate(a.offerTitle, 50) + '"' + (a.offerCode ? ' · কোড ' + a.offerCode : '') + (a.offerUntil ? ' · শেষ ' + formatDhakaDateTime(a.offerUntil) : '') : ''}\n` +
+    `🔔 নতুন video Auto-Notify (রাত ৮টা): ${st(a.autoDigest)}`;
   const T = (label, key) => Markup.button.callback(`${a[key] ? '🟢' : '🔴'} ${label}`, `adm_cfg_tgl_${key}`);
   const keyboard = Markup.inlineKeyboard([
     [T('Banner', 'announceOn'), Markup.button.callback('✏️ Banner লিখুন', 'adm_cfg_txt_announce')],
@@ -305,11 +312,165 @@ function appSettingsView() {
     [T('Search', 'search'), T('Hero Slider', 'hero')],
     [T('Protect Content', 'protect'), Markup.button.callback('⏱ Delete সময়', 'adm_cfg_min')],
     [Markup.button.callback('👋 Welcome Message', 'adm_cfg_txt_welcome'), Markup.button.callback('👑 VIP লিংক', 'adm_cfg_txt_vipUrl')],
+    [T('Offer Card', 'offerOn'), Markup.button.callback('🎁 Offer সেট করুন', 'adm_cfg_offer')],
+    [T('Auto-Notify', 'autoDigest'), Markup.button.callback('🔔 Subscribers / এখনই পাঠান', 'adm_cfg_digest')],
     [Markup.button.callback('⬅️ Back', 'adm_home')]
   ]);
   return { text, keyboard };
 }
 // ============ /APP SETTINGS ============
+
+// ============ 🔔 NEW-VIDEO DIGEST (low-read design) ============
+// Subscribers opt in from the Mini App (Worker writes system/notifySubs.ids). A digest = 1 read of that doc +
+// the (cached) topics list + N Telegram sends. Firestore cost does NOT depend on how many users you have.
+let digestRunning = false;
+async function getNotifyDoc() {
+  const d = await db.collection('system').doc('notifySubs').get();
+  const x = d.exists ? d.data() : {};
+  return { ids: (Array.isArray(x.ids) ? x.ids : []).map(String), lastDigestAt: Number(x.lastDigestAt) || 0 };
+}
+function digestFreshTopics(topics, since) {
+  const now = Date.now();
+  return (topics || []).filter(t => {
+    const c = new Date(t.createdAt || 0).getTime() || 0;
+    const pub = Number(t.publishAt) || 0;
+    return c > since && !(pub > now);
+  });
+}
+async function sendDigest() {
+  if (digestRunning) return { sent: 0, reason: 'busy' };
+  digestRunning = true;
+  try {
+    const n = await getNotifyDoc();
+    if (!n.ids.length) return { sent: 0, reason: 'no_subs' };
+    const topics = await getTopicsCached();
+    const fresh = digestFreshTopics(topics, n.lastDigestAt);
+    if (!fresh.length) return { sent: 0, reason: 'no_new' };
+    const titles = fresh.slice(0, 5).map(t => '• ' + safeTruncate(String(t.title || 'নতুন ভিডিও'), 50));
+    const more = fresh.length > 5 ? `\n…আরও ${fresh.length - 5}টি` : '';
+    const text = `🆕 নতুন ${fresh.length}টি ভিডিও এসেছে!\n\n${titles.join('\n')}${more}`;
+    const extra = { reply_markup: Markup.inlineKeyboard([[Markup.button.webApp('▶️ ভিডিও দেখুন', MINI_APP_URL)]]).reply_markup };
+    let sent = 0; const dead = [];
+    for (const id of n.ids) {
+      try { await bot.telegram.sendMessage(id, text, extra); sent++; }
+      catch (e) {
+        const m = String(e && (e.description || e.message) || '');
+        if (/blocked|chat not found|deactivated|kicked/i.test(m)) dead.push(id);
+        else if (/Too Many Requests|retry after/i.test(m)) { const ra = Number((m.match(/retry after (\d+)/i) || [])[1]) || 3; await new Promise(r => setTimeout(r, ra * 1000)); }
+      }
+      await new Promise(r => setTimeout(r, 55)); // stay under Telegram's ~30 msg/sec
+    }
+    const patch = { lastDigestAt: Date.now() };
+    if (dead.length) patch.ids = admin.firestore.FieldValue.arrayRemove(...dead.slice(0, 400));
+    await db.collection('system').doc('notifySubs').set(patch, { merge: true });
+    return { sent, fresh: fresh.length, dead: dead.length };
+  } finally { digestRunning = false; }
+}
+let lastAutoDigestDay = '';
+async function autoDigestTick() {
+  try {
+    if (!appSettings.autoDigest) return;
+    const hour = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Dhaka', hour: '2-digit', hour12: false }).format(new Date()));
+    const day = getDhakaDateKey();
+    if (hour !== 20 || lastAutoDigestDay === day) return;
+    lastAutoDigestDay = day;
+    const r = await sendDigest();
+    if (r.sent) await bot.telegram.sendMessage(ADMIN_ID, `🔔 Auto-Notify: ${r.sent} জনকে ${r.fresh}টি নতুন video জানানো হয়েছে।`).catch(() => {});
+  } catch (e) { console.error('autoDigestTick:', e.message); }
+}
+setInterval(autoDigestTick, 20 * 60 * 1000);
+
+// ============ 🔎 USER PROFILE (admin) ============
+async function showUserProfile(ctx, rawId) {
+  const id = String(rawId || '').trim();
+  if (!/^\d{3,15}$/.test(id)) return ctx.reply('❌ শুধু সংখ্যার Telegram ID দিন।');
+  const [uDoc, ordSnap, topics] = await Promise.all([
+    db.collection('users').doc(id).get(),
+    db.collection('paymentOrders').where('userId', '==', id).limit(30).get().catch(() => null),
+    getTopicsCached()
+  ]);
+  if (!uDoc.exists && (!ordSnap || ordSnap.empty)) return ctx.reply('📭 এই ID-র কোনো তথ্য পাওয়া যায়নি।');
+  const d = uDoc.exists ? uDoc.data() : {};
+  const orders = ordSnap ? ordSnap.docs.map(x => x.data()) : [];
+  const approved = orders.filter(o => o.status === 'approved');
+  const spent = approved.reduce((n, o) => n + (Number(o.price) || 0), 0);
+  const pbName = orders.length ? (orders[0].firstName || '') : '';
+  const payer = d.vipPayerName || (orders.find(o => o.payerName) || {}).payerName || '';
+  const name = d.firstName || d.first_name || d.vipName || pbName || 'নাম নেই';
+  const uname = d.username || d.vipUsername || (orders[0] && orders[0].username) || '';
+  const now = Date.now();
+  const vipLeft = Number(d.subscriptionExpiresAt) > now ? Math.ceil((Number(d.subscriptionExpiresAt) - now) / 86400000) : 0;
+  const watched = Array.isArray(d.watchedTopicIds) ? d.watchedTopicIds : [];
+  const byId = new Map((topics || []).map(t => [t.id, t]));
+  const recent = watched.slice(-5).reverse().map(tid => '   • ' + escapeHtml(safeTruncate(String((byId.get(tid) || {}).title || tid), 40)));
+  const today = getDhakaDateKey();
+  const adsToday = d.dailyAdDate === today ? (Number(d.dailyAdsUsed) || 0) : 0;
+  const joined = d.createdAt || d.joinedAt || d.firstSeenAt;
+  const joinedMs = joined && typeof joined.toMillis === 'function' ? joined.toMillis() : (new Date(joined || 0).getTime() || 0);
+  const text =
+    `🔎 USER PROFILE\n\n` +
+    `👤 <a href="tg://user?id=${id}">${escapeHtml(name)}</a>${uname ? ' (@' + escapeHtml(uname) + ')' : ''}\n` +
+    `🆔 <code>${id}</code>\n` +
+    (payer && payer !== name ? `✍️ পেমেন্টের নাম: ${escapeHtml(payer)}\n` : '') +
+    (joinedMs ? `📅 যোগ দিয়েছে: ${formatDhakaDateTime(joinedMs)}\n` : '') +
+    `\n👑 VIP: ${vipLeft ? vipLeft + ' দিন বাকি' : 'নেই'}\n` +
+    `🚫 Blocked: ${d.blocked === true ? 'হ্যাঁ' : 'না'}\n` +
+    `🎬 মোট দেখা video: ${watched.length}\n` +
+    `📺 আজকের Ad: ${adsToday}\n` +
+    `💳 Approved payment: ${approved.length}টি · মোট ${spent}৳\n` +
+    (recent.length ? `\n🕘 সাম্প্রতিক দেখা:\n${recent.join('\n')}` : '');
+  return ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🔎 আরেকটি ID', 'adm_uprofile'), Markup.button.callback('⬅️ Reports', 'adm_reports')]]).reply_markup });
+}
+
+// ============ ⏰ TOPIC PUBLISH SCHEDULE ============
+// topics/<id>.publishAt (ms) in the future => the topic is left out of system/topicsIndex (so the Mini App
+// can't see it) until that time. Timers rebuild the index at the exact moment; no polling, no extra reads.
+// Post <-> Video link: when a POST is scheduled, the video can be scheduled for the same moment, so the Mini App
+// shows it exactly when the channel post goes out. "Post Now" publishes the video right away.
+async function shouldLinkVideoDefault(topicId) {
+  const d = await db.collection('topics').doc(String(topicId)).get();
+  if (!d.exists) return false;
+  const t = d.data();
+  const created = new Date(t.createdAt || 0).getTime() || 0;
+  // ON for a fresh upload (<3 days) or one that is already hidden; OFF for old, already-public videos (re-posts).
+  return Number(t.publishAt) > Date.now() || (Date.now() - created < 3 * 86400000);
+}
+function schedRepeatKeyboard(state) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('একবারই (No Repeat)', 'sched_repeat:none')],
+    [Markup.button.callback('🔁 প্রতিদিন (Daily)', 'sched_repeat:daily')],
+    [Markup.button.callback('🔁 প্রতি সপ্তাহে (Weekly)', 'sched_repeat:weekly')],
+    [Markup.button.callback(`📺 Video-ও এই সময়ে প্রকাশ: ${state.linkVideo ? '✅ হ্যাঁ' : '❌ না'}`, 'sched_link')]
+  ]);
+}
+// Make a hidden/scheduled topic visible right now (used by "Post Now" and when a linked schedule is cancelled).
+async function releaseTopicNow(topicId, onlyIfAt) {
+  if (!topicId) return false;
+  const ref = db.collection('topics').doc(String(topicId));
+  const d = await ref.get();
+  if (!d.exists) return false;
+  const at = Number(d.data().publishAt) || 0;
+  if (!at || at <= Date.now()) return false;             // already visible: nothing to do (no write, no index rebuild)
+  if (onlyIfAt && at !== onlyIfAt) return false;          // someone set a different schedule meanwhile — leave it
+  await ref.set({ publishAt: admin.firestore.FieldValue.delete() }, { merge: true });
+  invalidateTopicsCache();
+  return true;
+}
+const publishTimers = new Map();
+function armPublishTimer(id, at) {
+  const prev = publishTimers.get(id);
+  if (prev && prev.at === at) return;
+  if (prev) clearTimeout(prev.h);
+  const wait = at - Date.now();
+  if (wait <= 0) { publishTimers.delete(id); return; }
+  const h = setTimeout(() => {
+    publishTimers.delete(id);
+    if (at - Date.now() > 1000) return armPublishTimer(id, at); // setTimeout was clamped (long wait) — re-arm
+    scheduleTopicsIndexRebuild();
+  }, Math.min(wait, 2147000000));
+  publishTimers.set(id, { at, h });
+}
+
 // 🐛 FIX (THE main cost driver for accounts with lots of uploaded videos):
 // getTopicsCached() reads the ENTIRE `topics` collection on every refresh —
 // Firestore bills that as one read PER DOCUMENT, not one read per query. So
@@ -486,7 +647,10 @@ async function rebuildTopicsIndex() {
   // could time out decoding it, which is why /api/topics started silently
   // returning an empty list. Build each card from an explicit allow-list
   // instead — only what the webapp card UI actually reads.
-  const cards = topics.map(t => ({
+  const nowTs = Date.now();
+  topics.forEach(t => { if (Number(t.publishAt) > nowTs) armPublishTimer(t.id, Number(t.publishAt)); });
+  const visibleTopics = topics.filter(t => !(Number(t.publishAt) > nowTs));
+  const cards = (visibleTopics.length ? visibleTopics : topics).map(t => ({
     id: t.id,
     title: t.title || '',
     thumbnail: t.thumbnail || '',
@@ -1567,8 +1731,14 @@ bot.action('pch_continue', async ctx => {
         lines.push(`❌ ${channelId} — ${e.message}`);
       }
     }
+    // Posting now => the video must be visible in the Mini App now too (only touches Firestore if it was hidden).
+    let nowNote = '';
+    if (saveEntries.length && Number(t.publishAt) > Date.now()) {
+      try { if (await releaseTopicNow(topicId)) nowNote = '\n\n📺 Video এখন Mini App-এ প্রকাশ হয়েছে।'; }
+      catch (e) { console.error('release on post now:', e.message); }
+    }
     return ctx.reply(
-      `📤 Post সম্পন্ন হয়েছে (${resolved.length}টি Channel):\n\n${lines.join('\n')}`,
+      `📤 Post সম্পন্ন হয়েছে (${resolved.length}টি Channel):\n\n${lines.join('\n')}${nowNote}`,
       { reply_markup: postDoneMarkup(saveEntries) }
     );
   }
@@ -2702,6 +2872,15 @@ bot.action(/^rsave:([a-f0-9]+)$/, async (ctx) => {
   }
 });
 
+bot.action('sched_link', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const state = postData[ctx.from.id];
+  if (!state || state.step !== 'schedule_repeat') return ctx.answerCbQuery('❌ Schedule data পাওয়া যায়নি। /post দিয়ে আবার শুরু করুন');
+  state.linkVideo = !state.linkVideo;
+  try { await ctx.answerCbQuery(state.linkVideo ? 'Video-ও এই সময়ে প্রকাশ হবে' : 'Video এখনকার মতোই থাকবে'); } catch (e) {}
+  return ctx.editMessageReplyMarkup(schedRepeatKeyboard(state).reply_markup).catch(() => {});
+});
+
 bot.action(/^sched_repeat:(none|daily|weekly)$/, async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
   const userId = ctx.from.id;
@@ -2738,11 +2917,20 @@ bot.action(/^sched_repeat:(none|daily|weekly)$/, async (ctx) => {
     });
     delete postData[userId];
     schedulePostTimer(docRef.id, parsed - Date.now());
+    let linkedNote = '';
+    if (state.linkVideo && state.topicId) {
+      try {
+        await db.collection('topics').doc(String(state.topicId)).set({ publishAt: parsed }, { merge: true });
+        invalidateTopicsCache();
+        armPublishTimer(String(state.topicId), parsed);
+        linkedNote = '\n📺 Video-ও এই সময়েই Mini App-এ প্রকাশ হবে (তার আগে লুকানো)।';
+      } catch (e) { console.error('link video schedule failed:', e.message); linkedNote = '\n⚠️ Video schedule করা যায়নি — video আগের মতোই দেখা যাবে।'; }
+    }
     const repeatLabel = recurrence === 'daily' ? '\n🔁 প্রতিদিন এই সময়ে repeat হবে (বাতিল না করা পর্যন্ত)।'
       : recurrence === 'weekly' ? '\n🔁 প্রতি সপ্তাহে এই সময়ে repeat হবে (বাতিল না করা পর্যন্ত)।'
       : '';
     return ctx.reply(
-      `✅ Post Schedule হয়েছে!\n\n📌 Title: ${state.title || 'নামবিহীন ভিডিও'}\n🆔 Schedule ID: <code>${docRef.id}</code>\n📅 সময়: ${formatDhakaDateTime(parsed)}${repeatLabel}\n\nনির্ধারিত সময়ে এটা নিজে থেকেই Channel-এ Post হয়ে যাবে।`,
+      `✅ Post Schedule হয়েছে!\n\n📌 Title: ${state.title || 'নামবিহীন ভিডিও'}\n🆔 Schedule ID: <code>${docRef.id}</code>\n📅 সময়: ${formatDhakaDateTime(parsed)}${repeatLabel}${linkedNote}\n\nনির্ধারিত সময়ে এটা নিজে থেকেই Channel-এ Post হয়ে যাবে।`,
       { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup }
     );
   } catch (error) {
@@ -2811,10 +2999,16 @@ bot.action('post_confirm', async (ctx) => {
     }
 
     delete postData[userId];
+    // Post Now => the video is published (visible in the Mini App) right now, even if it was scheduled before.
+    let nowNote = '';
+    if (saveEntries.length) {
+      try { if (await releaseTopicNow(state.topicId)) nowNote = '\n📺 Video এখন Mini App-এ প্রকাশ হয়েছে।'; }
+      catch (e) { console.error('release on post now:', e.message); }
+    }
     await ctx.reply(
       `📤 Post সম্পন্ন হয়েছে (${postingChannels.length}টি Channel):\n\n` +
       `🆔 Video/Topic ID: <code>${escapeHtml(state.topicId)}</code>\n\n` +
-      escapeHtml(lines.join('\n')),
+      escapeHtml(lines.join('\n')) + nowNote,
       { parse_mode: 'HTML', reply_markup: postDoneMarkup(saveEntries) }
     );
   } catch (error) {
@@ -3093,6 +3287,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       [Markup.button.callback('🖼️ Thumbnail Edit', 'adm_video_thumb')],
       [Markup.button.callback('🗑️ Delete Video', 'adm_video_delete')],
       [Markup.button.callback('🗂️ Bulk Select (Delete/Ads)', 'adm_bulk_topics')],
+      [Markup.button.callback('⏰ Publish Schedule', 'adm_vsched')],
       [Markup.button.callback('⬅️ Back', 'adm_home')]
     ]));
   }
@@ -3289,7 +3484,10 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
     if (action === 'cfg') return showCfg();
     if (action.startsWith('cfg_tgl_')) {
       const key = action.slice('cfg_tgl_'.length);
-      if (!['announceOn', 'maintOn', 'search', 'hero', 'protect'].includes(key)) return;
+      if (!['announceOn', 'maintOn', 'search', 'hero', 'protect', 'offerOn', 'autoDigest'].includes(key)) return;
+      if (key === 'offerOn' && !appSettings.offerOn && !appSettings.offerTitle) {
+        return ctx.answerCbQuery('আগে "🎁 Offer সেট করুন" চাপুন', { show_alert: true }).catch(() => {});
+      }
       if (key === 'announceOn' && !appSettings.announceOn && !appSettings.announce) {
         return ctx.answerCbQuery('আগে "✏️ Banner লিখুন" দিয়ে লেখা সেট করুন', { show_alert: true }).catch(() => {});
       }
@@ -3303,6 +3501,26 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       updateAdsData[ctx.from.id] = { step: 'cfg_' + key };
       const cur = appSettings[key] ? `\n\nবর্তমান:\n${appSettings[key]}` : '';
       return ctx.reply(`✏️ ${names[key]} পাঠান।\n(মুছে ডিফল্টে ফিরতে "-" লিখুন, বাতিল করতে /cancel)${cur}`);
+    }
+    if (action === 'cfg_offer') {
+      updateAdsData[ctx.from.id] = { step: 'cfg_offerTitle', offer: {} };
+      return ctx.reply('🎁 নতুন Offer (৪ ধাপ)\n\n১) অফারের শিরোনাম লিখুন। যেমন: "VIP এ ২০% ছাড়"\n(বাতিল: /cancel)');
+    }
+    if (action === 'cfg_digest' || action === 'cfg_digest_send') {
+      if (action === 'cfg_digest_send') {
+        await ctx.reply('⏳ পাঠানো শুরু হচ্ছে…').catch(() => {});
+        const r = await sendDigest();
+        const msg = r.reason === 'busy' ? '⏳ আগের পাঠানো এখনো চলছে।'
+          : r.reason === 'no_subs' ? '📭 এখনো কেউ Notification চালু করেনি।'
+          : r.reason === 'no_new' ? '📭 শেষ notification-এর পর কোনো নতুন video নেই।'
+          : `✅ ${r.sent} জনকে পাঠানো হয়েছে (${r.fresh}টি নতুন video)${r.dead ? `\n🧹 ${r.dead} জন bot block করেছে — list থেকে সরানো হয়েছে` : ''}`;
+        return ctx.reply(msg, Markup.inlineKeyboard([[Markup.button.callback('⚙️ Settings', 'adm_cfg')]]));
+      }
+      const n = await getNotifyDoc();
+      const topics = await getTopicsCached();
+      const fresh = digestFreshTopics(topics, n.lastDigestAt).length;
+      return ctx.reply(`🔔 NEW-VIDEO NOTIFICATION\n\n👥 Subscribers: ${n.ids.length}\n🆕 শেষ notification-এর পর নতুন video: ${fresh}\n🕒 শেষ পাঠানো: ${n.lastDigestAt ? formatDhakaDateTime(n.lastDigestAt) : '—'}\n\n💡 খরচ: প্রতিবার মাত্র ১টি Firestore read (user list পড়া হয় না)।`,
+        Markup.inlineKeyboard([[Markup.button.callback('📣 এখনই পাঠান', 'adm_cfg_digest_send')], [Markup.button.callback('⬅️ Back', 'adm_cfg')]]));
     }
     if (action === 'cfg_min') {
       const cur = appSettings.unlockMin;
@@ -3323,6 +3541,16 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   if (action === 'ads') return ctx.reply('📺 Ads Management', Markup.inlineKeyboard([[Markup.button.callback('📡 Ad Networks (ON/OFF)','adm_networks')],[Markup.button.callback('🎯 Set Video Ads','adm_set_ads')],[Markup.button.callback('🎯 Daily Limit','adm_daily_limit')],[Markup.button.callback('⬅️ Back','adm_home')]]));
   if (action === 'set_ads') { updateAdsData[ctx.from.id]={step:'topicId'}; return ctx.reply('🎯 Video/Topic ID পাঠান:'); }
   if (action === 'daily_limit') { const current=await getDailyAdLimit(); updateAdsData[ctx.from.id]={step:'dailyLimit'}; return ctx.reply(`📊 বর্তমান Daily Ad Limit: ${current}টি\n\nনতুন limit লিখুন:`); }
+  if (action === 'uprofile') {
+    clearAdminWorkflow(ctx.from.id);
+    updateAdsData[ctx.from.id] = { step: 'uprofile' };
+    return ctx.reply('🔎 যে ইউজারের তথ্য দেখতে চান তার Telegram ID পাঠান:');
+  }
+  if (action === 'vsched') {
+    clearAdminWorkflow(ctx.from.id);
+    updateAdsData[ctx.from.id] = { step: 'vsched_id' };
+    return ctx.reply('⏰ PUBLISH SCHEDULE\n\nযে Topic/Video পরে প্রকাশ করতে চান তার Topic ID পাঠান।\n(ID পেতে: Videos → 🆔 Video IDs)\n\nআগেই schedule করা থাকলে একই ID দিয়ে সময় বদলাতে বা বাতিল করতে পারবেন।');
+  }
   if (action === 'reports' || action === 'rep_week' || action === 'rep_top' || action === 'rep_top_all' || action === 'rep_dead') {
     const back = [Markup.button.callback('⬅️ Reports', 'adm_reports')];
     if (action === 'reports') {
@@ -3330,6 +3558,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
         [Markup.button.callback('📊 ৭ দিনের Ad ও আয়', 'adm_rep_week')],
         [Markup.button.callback('🏆 Top Video (৭ দিন)', 'adm_rep_top'), Markup.button.callback('🏆 Top (সব সময়)', 'adm_rep_top_all')],
         [Markup.button.callback('💤 কেউ দেখছে না এমন Video', 'adm_rep_dead')],
+        [Markup.button.callback('🔎 User Profile', 'adm_uprofile')],
         [Markup.button.callback('⬅️ Back', 'adm_home')]
       ]));
     }
@@ -4203,9 +4432,12 @@ bot.action(/^schedcancel_yes:(.+)$/, async (ctx) => {
   if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
   const id = ctx.match[1];
   try {
+    const spDoc = await db.collection('scheduledPosts').doc(id).get();
     await db.collection('scheduledPosts').doc(id).set({ status: 'cancelled' }, { merge: true });
     const timer = scheduledTimers.get(id);
     if (timer) { clearTimeout(timer); scheduledTimers.delete(id); }
+    // the video was hidden only for this post's time -> show it again
+    if (spDoc.exists) await releaseTopicNow(spDoc.data().topicId, Number(spDoc.data().scheduledAt)).catch(e => console.error('release on cancel:', e.message));
     try { await ctx.answerCbQuery('✅ বাতিল হয়েছে'); } catch (e) {}
   } catch (error) {
     console.error('❌ schedcancel_yes error:', error.message);
@@ -4224,9 +4456,11 @@ bot.action(/^schedcancel:(.+)$/, async (ctx) => {
   if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
   const id = ctx.match[1];
   try {
+    const spDoc = await db.collection('scheduledPosts').doc(id).get();
     await db.collection('scheduledPosts').doc(id).set({ status: 'cancelled' }, { merge: true });
     const timer = scheduledTimers.get(id);
     if (timer) { clearTimeout(timer); scheduledTimers.delete(id); }
+    if (spDoc.exists) await releaseTopicNow(spDoc.data().topicId, Number(spDoc.data().scheduledAt)).catch(e => console.error('release on cancel:', e.message));
     try { await ctx.answerCbQuery('✅ বাতিল হয়েছে'); } catch (e) {}
   } catch (error) {
     console.error('❌ schedcancel error:', error.message);
@@ -4736,13 +4970,10 @@ bot.on('text', async (ctx) => {
       }
       state.scheduleTime = parsed;
       state.step = 'schedule_repeat';
+      try { state.linkVideo = await shouldLinkVideoDefault(state.topicId); } catch (e) { state.linkVideo = false; }
       return ctx.reply(
-        `📅 সময়: ${formatDhakaDateTime(parsed)}\n\n🔁 এটা কি বারবার (repeat) post হবে, নাকি একবারই?`,
-        Markup.inlineKeyboard([
-          [Markup.button.callback('একবারই (No Repeat)', 'sched_repeat:none')],
-          [Markup.button.callback('🔁 প্রতিদিন (Daily)', 'sched_repeat:daily')],
-          [Markup.button.callback('🔁 প্রতি সপ্তাহে (Weekly)', 'sched_repeat:weekly')]
-        ])
+        `📅 সময়: ${formatDhakaDateTime(parsed)}\n\n📺 "Video-ও এই সময়ে প্রকাশ: হ্যাঁ" থাকলে video Mini App-এ ঠিক এই সময়েই আসবে (তার আগে লুকানো থাকবে)। পুরোনো video আবার post করলে "না" করে দিন।\n\n🔁 এটা কি বারবার (repeat) post হবে, নাকি একবারই?`,
+        schedRepeatKeyboard(state)
       );
     }
   }
@@ -4793,9 +5024,55 @@ bot.on('text', async (ctx) => {
     }
   }
 
+  if (userId === ADMIN_ID && updateAdsData[userId] && updateAdsData[userId].step === 'uprofile') {
+    delete updateAdsData[userId];
+    try { return await showUserProfile(ctx, text); }
+    catch (e) { console.error('showUserProfile:', e.message); return ctx.reply('❌ তথ্য আনতে সমস্যা: ' + e.message); }
+  }
+  if (userId === ADMIN_ID && updateAdsData[userId] && updateAdsData[userId].step === 'vsched_id') {
+    const tid = text.trim();
+    const doc = await db.collection('topics').doc(tid).get();
+    if (!doc.exists) return ctx.reply('❌ এই ID-র কোনো Topic নেই। ঠিক ID আবার পাঠান (বাতিল: /cancel)।');
+    const t = doc.data();
+    updateAdsData[userId] = { step: 'vsched_time', topicId: tid };
+    const cur = Number(t.publishAt) > Date.now() ? `\n\nবর্তমান schedule: ${formatDhakaDateTime(Number(t.publishAt))}` : '';
+    return ctx.reply(`🎬 ${safeTruncate(String(t.title || tid), 60)}${cur}\n\nকখন প্রকাশ হবে? (Dhaka সময়)\nউদাহরণ: 9:30 PM\nবা: 2026-10-25 21:30\n\n"now" লিখলে schedule বাতিল হয়ে এখনই দেখাবে।`);
+  }
+  if (userId === ADMIN_ID && updateAdsData[userId] && updateAdsData[userId].step === 'vsched_time') {
+    const tid = updateAdsData[userId].topicId;
+    const ref = db.collection('topics').doc(tid);
+    if (text.trim().toLowerCase() === 'now') {
+      delete updateAdsData[userId];
+      await ref.set({ publishAt: admin.firestore.FieldValue.delete() }, { merge: true });
+      invalidateTopicsCache();
+      return ctx.reply('✅ Schedule বাতিল — video এখন থেকে Mini App-এ দেখাবে।', Markup.inlineKeyboard([[Markup.button.callback('🎬 Videos', 'adm_videos')]]));
+    }
+    const at = parseDhakaDateTime(text);
+    if (!at) return ctx.reply('❌ সময় বোঝা যায়নি। যেমন: 9:30 PM বা 2026-10-25 21:30');
+    if (at <= Date.now() + 60000) return ctx.reply('❌ সময়টা ভবিষ্যতের হতে হবে।');
+    delete updateAdsData[userId];
+    await ref.set({ publishAt: at }, { merge: true });
+    invalidateTopicsCache();
+    armPublishTimer(tid, at);
+    return ctx.reply(`✅ ${formatDhakaDateTime(at)} পর্যন্ত video লুকানো থাকবে, তারপর নিজে নিজে Mini App-এ আসবে।`, Markup.inlineKeyboard([[Markup.button.callback('🎬 Videos', 'adm_videos')]]));
+  }
+
   if (userId === ADMIN_ID && updateAdsData[userId] && String(updateAdsData[userId].step || '').startsWith('cfg_')) {
     const key = updateAdsData[userId].step.slice(4);
     const backKb = { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('⚙️ Settings', 'adm_cfg')]]).reply_markup };
+    if (key.startsWith('offer')) {
+      const offer = (updateAdsData[userId] && updateAdsData[userId].offer) || {};
+      if (key === 'offerTitle') { offer.title = text.slice(0, 60); updateAdsData[userId] = { step: 'cfg_offerText', offer }; return ctx.reply('✏️ ২) অফারের বর্ণনা লিখুন (সর্বোচ্চ ৩০০ অক্ষর)। যেমন: "৩০ দিনের VIP এখন কম দামে"'); }
+      if (key === 'offerText') { offer.text = text.slice(0, 300); updateAdsData[userId] = { step: 'cfg_offerCode', offer }; return ctx.reply('🏷 ৩) Coupon কোড লিখুন (না থাকলে "-" লিখুন):'); }
+      if (key === 'offerCode') { offer.code = text === '-' ? '' : text.replace(/\s+/g, '').toUpperCase().slice(0, 30); updateAdsData[userId] = { step: 'cfg_offerHours', offer }; return ctx.reply('⏳ ৪) অফার কত ঘণ্টা চলবে? সংখ্যা লিখুন (0 = নিজে বন্ধ না করা পর্যন্ত):'); }
+      if (key === 'offerHours') {
+        const h = Number(text);
+        if (!Number.isFinite(h) || h < 0 || h > 720) return ctx.reply('❌ 0 থেকে 720 এর মধ্যে সংখ্যা লিখুন।');
+        delete updateAdsData[userId];
+        await saveAppSettings({ offerOn: true, offerTitle: offer.title || '', offerText: offer.text || '', offerCode: offer.code || '', offerUntil: h > 0 ? Date.now() + h * 3600000 : 0 });
+        return ctx.reply('✅ Offer Card চালু হয়েছে — Mini App-এ ~১ মিনিটের মধ্যে দেখাবে।', backKb);
+      }
+    }
     if (key === 'unlockMin') {
       const m = Number(text);
       if (!Number.isInteger(m) || m < 1 || m > 1440) return ctx.reply('❌ ১ থেকে ১৪৪০ এর মধ্যে পূর্ণ সংখ্যা লিখুন।');
