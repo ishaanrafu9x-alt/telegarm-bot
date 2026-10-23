@@ -97,6 +97,7 @@ bot.use(async (ctx, next) => {
 // Admin reply-keyboard buttons are routed through synthetic callback queries
 // (id starts with 'kb_'). Telegram has no such query, so answerCbQuery is a no-op.
 bot.use(async (ctx, next) => {
+  lastUpdateAt = Date.now();
   if (ctx.callbackQuery && String(ctx.callbackQuery.id).startsWith('kb_')) {
     ctx.answerCbQuery = async () => true;
   }
@@ -295,7 +296,7 @@ function appSettingsView() {
   const a = appSettings, st = (v) => (v ? '🟢 ON' : '🔴 OFF');
   const cut = (t) => (t ? `"${safeTruncate(t, 60)}"` : '— (নেই)');
   const text =
-    `⚙️ APP SETTINGS\n` +
+    `⚙️ APP SETTINGS  ·  build ${BUILD_ID}\n` +
     `(কোড না বদলেই Mini App ও Bot নিয়ন্ত্রণ — ~১ মিনিটে কার্যকর)\n\n` +
     `📢 Announcement Banner: ${st(a.announceOn)}\n    ${cut(a.announce)}\n` +
     `🛠 Maintenance Mode: ${st(a.maintOn)}\n    ${cut(a.maint)}\n` +
@@ -398,10 +399,15 @@ async function showUserProfile(ctx, rawId) {
   const orders = ordSnap ? ordSnap.docs.map(x => x.data()) : [];
   const approved = orders.filter(o => o.status === 'approved');
   const spent = approved.reduce((n, o) => n + (Number(o.price) || 0), 0);
-  const pbName = orders.length ? (orders[0].firstName || '') : '';
-  const payer = d.vipPayerName || (orders.find(o => o.payerName) || {}).payerName || '';
+  let pbName = orders.length ? (orders[0].firstName || '') : '';
+  let pbUser = '';
+  let pbPayer = '';
+  if (!pbName) {
+    try { const pb = await db.collection('paymentBotUsers').doc(id).get(); if (pb.exists) { pbName = pb.data().firstName || ''; pbUser = pb.data().username || ''; pbPayer = pb.data().payerName || ''; } } catch (_) {}
+  }
+  const payer = d.vipPayerName || (orders.find(o => o.payerName) || {}).payerName || pbPayer || '';
   const name = d.firstName || d.first_name || d.vipName || pbName || 'নাম নেই';
-  const uname = d.username || d.vipUsername || (orders[0] && orders[0].username) || '';
+  const uname = d.username || d.vipUsername || (orders[0] && orders[0].username) || pbUser || '';
   const now = Date.now();
   const vipLeft = Number(d.subscriptionExpiresAt) > now ? Math.ceil((Number(d.subscriptionExpiresAt) - now) / 86400000) : 0;
   const watched = Array.isArray(d.watchedTopicIds) ? d.watchedTopicIds : [];
@@ -554,6 +560,9 @@ let cleanupRunning = false;
 // now checks this flag first and skips entirely if this process never
 // actually became the live bot instance.
 let botLaunched = false;
+const BUILD_ID = '2026-10-23-hold-uploads-v2'; // shown in /health and Admin -> Settings, so you can tell which code is live
+let lastLaunchError = '';
+let lastUpdateAt = 0;
 let adminStatsCache = null;
 let adminStatsCacheAt = 0;
 let adminUserCursor = null;
@@ -6237,10 +6246,14 @@ app.post('/api/unlock-topic', async (req, res) => {
 // =============================================
 
 app.get('/health', (req, res) => {
-  const botRunning = !!(bot && bot.telegram);
+  const botRunning = !!botLaunched;   // true only after Telegram accepted the connection (polling is live)
   res.json({
     ok: true,
+    build: BUILD_ID,
     botRunning,
+    launchAttempts: typeof launchAttempt === 'number' ? launchAttempt : 0,
+    lastLaunchError: lastLaunchError || null,
+    lastUpdateSecondsAgo: lastUpdateAt ? Math.round((Date.now() - lastUpdateAt) / 1000) : null,
     uptime: Math.floor(process.uptime()),
     time: new Date().toISOString(),
     memory: process.memoryUsage().rss
@@ -7053,6 +7066,7 @@ function launchBot() {
     .catch(err => {
       launchFailed = true;
       launchAttempt++;
+      lastLaunchError = String(err && err.message || err).slice(0, 300);
       const detail = [err.code, err.type, err.errno, err.cause && (err.cause.code || err.cause.message)].filter(Boolean).join(' / ');
       // Never give up: retry with back-off (5s, 10s, 20s, 40s, then every 60s) until Telegram is reachable.
       const delay = Math.min(60000, 5000 * Math.pow(2, Math.min(launchAttempt - 1, 4)));
