@@ -717,6 +717,8 @@ async function getSingleTopicCached(topicId) {
       type: data.type || 'single',
       videoCount: Number(data.videoCount) || (Array.isArray(data.videos) ? data.videos.length : 0),
       unlockCount: Number(data.unlockCount) || 0,
+      publishAt: Number(data.publishAt) || 0,
+      held: data.held === true,
       // 🐛 FIX (extra Firestore read on every single unlock): delivery used to
       // do its OWN separate `topicRef.get()` just to fetch `videos`, even
       // though this cache had just been populated moments earlier for the
@@ -3241,6 +3243,93 @@ async function renderBulkTopicsPanel(ctx) {
   return ctx.editMessageText(text, Markup.inlineKeyboard(rows));
 }
 
+// ============ 🙈 HIDDEN / SCHEDULED VIDEOS (admin list) ============
+// Lists every video that is currently invisible in the Mini App — either held until its channel
+// post goes out (`held`) or waiting for a future `publishAt` — with a button to publish it EARLY.
+// Uses two narrow queries (only the hidden docs are read), not a full topics scan.
+async function fetchHiddenTopics() {
+  const now = Date.now();
+  const [h, s] = await Promise.all([
+    db.collection('topics').where('held', '==', true).get(),
+    db.collection('topics').where('publishAt', '>', now).get()
+  ]);
+  const map = new Map();
+  [...h.docs, ...s.docs].forEach(d => map.set(d.id, { id: d.id, ...d.data() }));
+  const arr = [...map.values()];
+  // Scheduled ones first (soonest first), then the "waiting for post" ones (newest first).
+  arr.sort((a, b) => {
+    const pa = Number(a.publishAt) > now ? Number(a.publishAt) : Infinity;
+    const pb = Number(b.publishAt) > now ? Number(b.publishAt) : Infinity;
+    if (pa !== pb) return pa - pb;
+    return (new Date(b.createdAt || 0).getTime() || 0) - (new Date(a.createdAt || 0).getTime() || 0);
+  });
+  return arr;
+}
+
+async function renderHiddenVideos(ctx) {
+  const now = Date.now();
+  const list = await fetchHiddenTopics();
+  const back = [Markup.button.callback('⬅️ Back', 'adm_videos')];
+  if (!list.length) {
+    const t = '✅ এখন কোনো Video লুকানো বা schedule করা নেই।\n(সব video Mini App-এ দেখা যাচ্ছে।)';
+    const kb = Markup.inlineKeyboard([[Markup.button.callback('🔄 Refresh', 'hv_list')], back]);
+    return ctx.editMessageText(t, kb).catch(() => ctx.reply(t, kb));
+  }
+  const MAX = 15;
+  const shown = list.slice(0, MAX);
+  let text = `🙈 HIDDEN / SCHEDULED VIDEOS (${list.length}টি)\n\n`;
+  const rows = [];
+  shown.forEach((t, i) => {
+    const title = safeTruncate(String(t.title || 'নামবিহীন ভিডিও'), 40);
+    const at = Number(t.publishAt) || 0;
+    const status = at > now ? `⏰ ${formatDhakaDateTime(at)} এ প্রকাশ হবে` : '📮 Channel-এ Post না হওয়া পর্যন্ত লুকানো';
+    text += `${i + 1}. 📌 ${escapeHtml(title)}\n    ${status}\n    🆔 <code>${escapeHtml(t.id)}</code>\n\n`;
+    rows.push([
+      Markup.button.callback(`⚡ ${i + 1}. এখনই Publish`, `hv_pub:${t.id}`),
+      Markup.button.callback(`⏰ ${i + 1}. সময় বদলান`, `hv_time:${t.id}`)
+    ]);
+  });
+  if (list.length > MAX) text += `…আরও ${list.length - MAX}টি আছে (এগুলো প্রকাশ হলে দেখা যাবে)।\n\n`;
+  text += 'ℹ️ "এখনই Publish" চাপলে video সাথে সাথে Mini App-এ দেখাবে। Channel post আলাদাভাবে নির্ধারিত সময়েই যাবে।';
+  rows.push([Markup.button.callback('🔄 Refresh', 'hv_list')], back);
+  const extra = { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard(rows).reply_markup };
+  return ctx.editMessageText(text, extra).catch(() => ctx.reply(text, extra));
+}
+
+bot.action('hv_list', async (ctx) => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  try { await ctx.answerCbQuery(); } catch (e) {}
+  try { return await renderHiddenVideos(ctx); }
+  catch (e) { console.error('hidden list error:', e.message); return ctx.reply('❌ List আনতে সমস্যা: ' + e.message); }
+});
+
+bot.action(/^hv_pub:(.+)$/, async (ctx) => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const id = ctx.match[1];
+  try {
+    const changed = await releaseTopicNow(id);
+    try { await ctx.answerCbQuery(changed ? '✅ Video এখন Mini App-এ দেখাচ্ছে' : 'ℹ️ এটা আগে থেকেই visible'); } catch (e) {}
+    return await renderHiddenVideos(ctx);
+  } catch (e) {
+    console.error('hv_pub error:', e.message);
+    try { await ctx.answerCbQuery('❌ ' + safeTruncate(e.message, 150)); } catch (_) {}
+  }
+});
+
+bot.action(/^hv_time:(.+)$/, async (ctx) => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  try { await ctx.answerCbQuery(); } catch (e) {}
+  const id = ctx.match[1];
+  try {
+    const doc = await db.collection('topics').doc(id).get();
+    if (!doc.exists) return ctx.reply('❌ এই Video আর নেই।');
+    clearAdminWorkflow(ctx.from.id);
+    updateAdsData[ctx.from.id] = { step: 'vsched_time', topicId: id };
+    return ctx.reply(`🎬 ${safeTruncate(String(doc.data().title || id), 60)}\n\nকখন প্রকাশ হবে? (Dhaka সময়)\nউদাহরণ: 9:30 PM\nবা: 2026-10-25 21:30\n\n"now" লিখলে এখনই দেখাবে।`);
+  } catch (e) { return ctx.reply('❌ ' + e.message); }
+});
+// ============ /HIDDEN / SCHEDULED VIDEOS ============
+
 bot.action(/^adm_(.+)$/, async (ctx) => {
   if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
   const action = ctx.match[1];
@@ -3306,6 +3395,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       [Markup.button.callback('🖼️ Thumbnail Edit', 'adm_video_thumb')],
       [Markup.button.callback('🗑️ Delete Video', 'adm_video_delete')],
       [Markup.button.callback('🗂️ Bulk Select (Delete/Ads)', 'adm_bulk_topics')],
+      [Markup.button.callback('🙈 Hidden / Scheduled Videos', 'hv_list')],
       [Markup.button.callback('⏰ Publish Schedule', 'adm_vsched')],
       [Markup.button.callback('⬅️ Back', 'adm_home')]
     ]));
@@ -5070,7 +5160,8 @@ bot.on('text', async (ctx) => {
     if (!at) return ctx.reply('❌ সময় বোঝা যায়নি। যেমন: 9:30 PM বা 2026-10-25 21:30');
     if (at <= Date.now() + 60000) return ctx.reply('❌ সময়টা ভবিষ্যতের হতে হবে।');
     delete updateAdsData[userId];
-    await ref.set({ publishAt: at }, { merge: true });
+    // held must be cleared too — otherwise a "waiting for post" video stays hidden even after publishAt passes.
+    await ref.set({ publishAt: at, held: admin.firestore.FieldValue.delete() }, { merge: true });
     invalidateTopicsCache();
     armPublishTimer(tid, at);
     return ctx.reply(`✅ ${formatDhakaDateTime(at)} পর্যন্ত video লুকানো থাকবে, তারপর নিজে নিজে Mini App-এ আসবে।`, Markup.inlineKeyboard([[Markup.button.callback('🎬 Videos', 'adm_videos')]]));
@@ -5568,13 +5659,14 @@ app.get('/api/topic/:topicId', async (req, res) => {
     // share one Firestore read instead of creating hundreds/thousands of reads.
     const topic = await getSingleTopicCached(topicId);
     if (!topic) return res.status(404).json({ error: 'Topic not found' });
+    if (topic.held === true || Number(topic.publishAt) > Date.now()) return res.status(404).json({ error: 'Topic not found' });
 
     // 🔒 The cache entry now also carries `videos` (raw Telegram file_ids) so
     // the delivery path can reuse it instead of a second Firestore read —
     // but those file_ids must NEVER reach a public client response, or
     // anyone could fetch the "locked" video directly from Telegram without
     // ever watching an ad. Strip it here, right before it leaves the server.
-    const { videos, ...publicTopic } = topic;
+    const { videos, publishAt, held, ...publicTopic } = topic;
 
     res.set('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
     res.json(publicTopic);
@@ -5587,11 +5679,16 @@ app.get('/api/topic/:topicId', async (req, res) => {
 app.get('/api/topics', async (req, res) => {
   try {
     const topics = await getTopicsCached();
-    const cards = topics.map(({ videos, ...topic }) => ({
+    // 🙈 Hidden (held until its channel post) or scheduled (publishAt in the future) videos must NOT
+    // reach the Mini App. Checked against the clock on every request, so a video appears by itself
+    // the moment its publishAt passes — no timer or cache refresh needed.
+    const nowTs = Date.now();
+    const visible = topics.filter(t => !(Number(t.publishAt) > nowTs) && t.held !== true);
+    const cards = visible.map(({ videos, publishAt, held, ...topic }) => ({
       ...topic,
       videoCount: topic.videoCount || (Array.isArray(videos) ? videos.length : 0)
     }));
-    res.set('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
+    res.set('Cache-Control', 'public, max-age=15, stale-while-revalidate=30');
     res.json(cards);
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
