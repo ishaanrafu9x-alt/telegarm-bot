@@ -251,7 +251,7 @@ let THIRTY_MINUTES = 30 * 60 * 1000; // now adjustable: Admin Panel -> Settings 
 
 // ============ ⚙️ APP SETTINGS (Admin Panel -> Settings) ============
 // One JSON string stored in system/adSettings.appJson (same doc the Worker already reads, so 0 extra reads).
-const APP_DEFAULTS = { announceOn: false, announce: '', maintOn: false, maint: '', hero: true, search: true, protect: true, unlockMin: 30, welcome: '', vipUrl: '', offerOn: false, offerTitle: '', offerText: '', offerCode: '', offerUntil: 0, autoDigest: false };
+const APP_DEFAULTS = { announceOn: false, announce: '', maintOn: false, maint: '', hero: true, search: true, protect: true, unlockMin: 30, welcome: '', vipUrl: '', offerOn: false, offerTitle: '', offerText: '', offerCode: '', offerUntil: 0, autoDigest: false, holdNew: true };
 let appSettings = { ...APP_DEFAULTS };
 function sanitizeApp(o) {
   o = o && typeof o === 'object' ? o : {};
@@ -262,6 +262,7 @@ function sanitizeApp(o) {
   if (typeof o.welcome === 'string') c.welcome = o.welcome.slice(0, 800);
   if (typeof o.offerOn === 'boolean') c.offerOn = o.offerOn;
   if (typeof o.autoDigest === 'boolean') c.autoDigest = o.autoDigest;
+  if (typeof o.holdNew === 'boolean') c.holdNew = o.holdNew;
   for (const k of ['offerTitle', 'offerText', 'offerCode']) if (typeof o[k] === 'string') c[k] = o[k].slice(0, k === 'offerText' ? 300 : 60);
   const ou = Number(o.offerUntil);
   if (Number.isFinite(ou) && ou >= 0) c.offerUntil = ou;
@@ -288,6 +289,7 @@ async function saveAppSettings(patch) {
   applyAppSettings(next);
   return next;
 }
+function heldNote() { return appSettings.holdNew ? '\n🙈 Post না করা পর্যন্ত এটা Mini App-এ লুকানো থাকবে।' : ''; }
 function minLabel(m) { return m % 60 === 0 && m >= 60 ? `${m / 60} ঘণ্টা` : `${m} মিনিট`; }
 function appSettingsView() {
   const a = appSettings, st = (v) => (v ? '🟢 ON' : '🔴 OFF');
@@ -304,7 +306,8 @@ function appSettingsView() {
     `👋 Welcome Message: ${a.welcome ? 'Custom' : 'Default'}\n` +
     `👑 VIP কেনার লিংক: ${a.vipUrl || '— (নেই, বাটন লুকানো)'}\n` +
     `🎁 Offer Card: ${st(a.offerOn)}${a.offerTitle ? '\n    "' + safeTruncate(a.offerTitle, 50) + '"' + (a.offerCode ? ' · কোড ' + a.offerCode : '') + (a.offerUntil ? ' · শেষ ' + formatDhakaDateTime(a.offerUntil) : '') : ''}\n` +
-    `🔔 নতুন video Auto-Notify (রাত ৮টা): ${st(a.autoDigest)}`;
+    `🔔 নতুন video Auto-Notify (রাত ৮টা): ${st(a.autoDigest)}\n` +
+    `🙈 নতুন upload Post না হওয়া পর্যন্ত লুকানো: ${st(a.holdNew)}`;
   const T = (label, key) => Markup.button.callback(`${a[key] ? '🟢' : '🔴'} ${label}`, `adm_cfg_tgl_${key}`);
   const keyboard = Markup.inlineKeyboard([
     [T('Banner', 'announceOn'), Markup.button.callback('✏️ Banner লিখুন', 'adm_cfg_txt_announce')],
@@ -314,6 +317,7 @@ function appSettingsView() {
     [Markup.button.callback('👋 Welcome Message', 'adm_cfg_txt_welcome'), Markup.button.callback('👑 VIP লিংক', 'adm_cfg_txt_vipUrl')],
     [T('Offer Card', 'offerOn'), Markup.button.callback('🎁 Offer সেট করুন', 'adm_cfg_offer')],
     [T('Auto-Notify', 'autoDigest'), Markup.button.callback('🔔 Subscribers / এখনই পাঠান', 'adm_cfg_digest')],
+    [T('নতুন Video লুকানো (Post পর্যন্ত)', 'holdNew')],
     [Markup.button.callback('⬅️ Back', 'adm_home')]
   ]);
   return { text, keyboard };
@@ -334,7 +338,7 @@ function digestFreshTopics(topics, since) {
   return (topics || []).filter(t => {
     const c = new Date(t.createdAt || 0).getTime() || 0;
     const pub = Number(t.publishAt) || 0;
-    return c > since && !(pub > now);
+    return c > since && !(pub > now) && t.held !== true;
   });
 }
 async function sendDigest() {
@@ -431,9 +435,9 @@ async function shouldLinkVideoDefault(topicId) {
   const d = await db.collection('topics').doc(String(topicId)).get();
   if (!d.exists) return false;
   const t = d.data();
-  const created = new Date(t.createdAt || 0).getTime() || 0;
-  // ON for a fresh upload (<3 days) or one that is already hidden; OFF for old, already-public videos (re-posts).
-  return Number(t.publishAt) > Date.now() || (Date.now() - created < 3 * 86400000);
+  // ON by default (post time = video time). Only OFF when the video has already been unlocked by users,
+  // i.e. it is clearly public already and this schedule is a re-post. The admin can still flip the button.
+  return !(Number(t.unlockCount) > 0);
 }
 function schedRepeatKeyboard(state) {
   return Markup.inlineKeyboard([
@@ -450,9 +454,11 @@ async function releaseTopicNow(topicId, onlyIfAt) {
   const d = await ref.get();
   if (!d.exists) return false;
   const at = Number(d.data().publishAt) || 0;
-  if (!at || at <= Date.now()) return false;             // already visible: nothing to do (no write, no index rebuild)
-  if (onlyIfAt && at !== onlyIfAt) return false;          // someone set a different schedule meanwhile — leave it
-  await ref.set({ publishAt: admin.firestore.FieldValue.delete() }, { merge: true });
+  const held = d.data().held === true;
+  const futureAt = at > Date.now();
+  if (!held && !futureAt) return false;                   // already visible: nothing to do (no write, no index rebuild)
+  if (onlyIfAt && !(futureAt && at === onlyIfAt)) return false; // someone set a different schedule meanwhile — leave it
+  await ref.set({ publishAt: admin.firestore.FieldValue.delete(), held: admin.firestore.FieldValue.delete() }, { merge: true });
   invalidateTopicsCache();
   return true;
 }
@@ -649,7 +655,8 @@ async function rebuildTopicsIndex() {
   // instead — only what the webapp card UI actually reads.
   const nowTs = Date.now();
   topics.forEach(t => { if (Number(t.publishAt) > nowTs) armPublishTimer(t.id, Number(t.publishAt)); });
-  const visibleTopics = topics.filter(t => !(Number(t.publishAt) > nowTs));
+  const isHiddenTopic = (t) => Number(t.publishAt) > nowTs || t.held === true;
+  const visibleTopics = topics.filter(t => !isHiddenTopic(t));
   const cards = (visibleTopics.length ? visibleTopics : topics).map(t => ({
     id: t.id,
     title: t.title || '',
@@ -1733,7 +1740,7 @@ bot.action('pch_continue', async ctx => {
     }
     // Posting now => the video must be visible in the Mini App now too (only touches Firestore if it was hidden).
     let nowNote = '';
-    if (saveEntries.length && Number(t.publishAt) > Date.now()) {
+    if (saveEntries.length && (Number(t.publishAt) > Date.now() || t.held === true)) {
       try { if (await releaseTopicNow(topicId)) nowNote = '\n\n📺 Video এখন Mini App-এ প্রকাশ হয়েছে।'; }
       catch (e) { console.error('release on post now:', e.message); }
     }
@@ -2917,10 +2924,13 @@ bot.action(/^sched_repeat:(none|daily|weekly)$/, async (ctx) => {
     });
     delete postData[userId];
     schedulePostTimer(docRef.id, parsed - Date.now());
-    let linkedNote = '';
+    let linkedNote = '\n📺 Video এখনই Mini App-এ দেখা যাচ্ছে।';
+    if (!state.linkVideo && state.topicId) {
+      try { await releaseTopicNow(state.topicId); } catch (e) { console.error('release (link off):', e.message); }
+    }
     if (state.linkVideo && state.topicId) {
       try {
-        await db.collection('topics').doc(String(state.topicId)).set({ publishAt: parsed }, { merge: true });
+        await db.collection('topics').doc(String(state.topicId)).set({ publishAt: parsed, held: admin.firestore.FieldValue.delete() }, { merge: true });
         invalidateTopicsCache();
         armPublishTimer(String(state.topicId), parsed);
         linkedNote = '\n📺 Video-ও এই সময়েই Mini App-এ প্রকাশ হবে (তার আগে লুকানো)।';
@@ -3484,7 +3494,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
     if (action === 'cfg') return showCfg();
     if (action.startsWith('cfg_tgl_')) {
       const key = action.slice('cfg_tgl_'.length);
-      if (!['announceOn', 'maintOn', 'search', 'hero', 'protect', 'offerOn', 'autoDigest'].includes(key)) return;
+      if (!['announceOn', 'maintOn', 'search', 'hero', 'protect', 'offerOn', 'autoDigest', 'holdNew'].includes(key)) return;
       if (key === 'offerOn' && !appSettings.offerOn && !appSettings.offerTitle) {
         return ctx.answerCbQuery('আগে "🎁 Offer সেট করুন" চাপুন', { show_alert: true }).catch(() => {});
       }
@@ -4972,7 +4982,7 @@ bot.on('text', async (ctx) => {
       state.step = 'schedule_repeat';
       try { state.linkVideo = await shouldLinkVideoDefault(state.topicId); } catch (e) { state.linkVideo = false; }
       return ctx.reply(
-        `📅 সময়: ${formatDhakaDateTime(parsed)}\n\n📺 "Video-ও এই সময়ে প্রকাশ: হ্যাঁ" থাকলে video Mini App-এ ঠিক এই সময়েই আসবে (তার আগে লুকানো থাকবে)। পুরোনো video আবার post করলে "না" করে দিন।\n\n🔁 এটা কি বারবার (repeat) post হবে, নাকি একবারই?`,
+        `📅 সময়: ${formatDhakaDateTime(parsed)}\n\n📺 "Video-ও এই সময়ে প্রকাশ: হ্যাঁ" থাকলে video Mini App-এ ঠিক এই সময়েই আসবে (তার আগে লুকানো থাকবে)। যে video আগেই চালু (আগে কেউ unlock করেছে), সেটা আবার post করলে "না" থাকে।\n\n🔁 এটা কি বারবার (repeat) post হবে, নাকি একবারই?`,
         schedRepeatKeyboard(state)
       );
     }
@@ -5043,7 +5053,7 @@ bot.on('text', async (ctx) => {
     const ref = db.collection('topics').doc(tid);
     if (text.trim().toLowerCase() === 'now') {
       delete updateAdsData[userId];
-      await ref.set({ publishAt: admin.firestore.FieldValue.delete() }, { merge: true });
+      await ref.set({ publishAt: admin.firestore.FieldValue.delete(), held: admin.firestore.FieldValue.delete() }, { merge: true });
       invalidateTopicsCache();
       return ctx.reply('✅ Schedule বাতিল — video এখন থেকে Mini App-এ দেখাবে।', Markup.inlineKeyboard([[Markup.button.callback('🎬 Videos', 'adm_videos')]]));
     }
@@ -5402,11 +5412,12 @@ async function saveTopic(ctx, data) {
       videoCount: data.videos.length,
       unlockCount: 0,
       postRecords: [],
+      ...(appSettings.holdNew ? { held: true } : {}),
       sortOrder: Date.now(),
       createdAt: new Date().toISOString()
     });
     invalidateTopicsCache();
-    await ctx.reply(`✅ টপিক <code>${escapeHtml(data.title)}</code> তৈরি হয়েছে!\n📹 ভিডিও সংখ্যা: ${data.videos.length}\n🔢 অ্যাড প্রয়োজন: ${data.adsRequired}\n🆔 টপিক আইডি: <code>${topicRef.id}</code>\n\n📢 এখন Post করবেন কি? (Post Now বা Schedule — শুধু Thumbnail + Title যাবে, ভিডিও যাবে না)`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
+    await ctx.reply(`✅ টপিক <code>${escapeHtml(data.title)}</code> তৈরি হয়েছে!\n📹 ভিডিও সংখ্যা: ${data.videos.length}\n🔢 অ্যাড প্রয়োজন: ${data.adsRequired}\n🆔 টপিক আইডি: <code>${topicRef.id}</code>${heldNote()}\n\n📢 এখন Post করবেন কি? (Post Now বা Schedule — শুধু Thumbnail + Title যাবে, ভিডিও যাবে না)`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
       [Markup.button.callback('📢 Post করুন (Thumbnail + Title)', 'apost_thumb:' + topicRef.id)],
       [Markup.button.callback('❌ না, এখন না', 'adm_home')]
     ]).reply_markup });
@@ -5428,11 +5439,12 @@ async function saveVideo(ctx, data) {
       videoCount: 1,
       unlockCount: 0,
       postRecords: [],
+      ...(appSettings.holdNew ? { held: true } : {}),
       sortOrder: Date.now(),
       createdAt: new Date().toISOString()
     });
     invalidateTopicsCache();
-    await ctx.reply(`✅ ভিডিও <code>${escapeHtml(data.title)}</code> যোগ হয়েছে!\n🆔 টপিক আইডি: <code>${topicRef.id}</code>\n\n📢 এখন Post করবেন কি? (Post Now বা Schedule — শুধু Thumbnail + Title যাবে, ভিডিও যাবে না)`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
+    await ctx.reply(`✅ ভিডিও <code>${escapeHtml(data.title)}</code> যোগ হয়েছে!\n🆔 টপিক আইডি: <code>${topicRef.id}</code>${heldNote()}\n\n📢 এখন Post করবেন কি? (Post Now বা Schedule — শুধু Thumbnail + Title যাবে, ভিডিও যাবে না)`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
       [Markup.button.callback('📢 Post করুন (Thumbnail + Title)', 'apost_thumb:' + topicRef.id)],
       [Markup.button.callback('❌ না, এখন না', 'adm_home')]
     ]).reply_markup });
@@ -5457,6 +5469,7 @@ async function saveDuplicateTopic(ctx, data) {
       videoCount: data.videos.length,
       unlockCount: 0,
       postRecords: [],
+      ...(appSettings.holdNew ? { held: true } : {}),
       sortOrder: Date.now(),
       createdAt: new Date().toISOString(),
       duplicatedFrom: data.sourceId || null
@@ -6515,6 +6528,7 @@ async function firePostSchedule(docId) {
       }
     }
     await ref.set({ status: 'sent', sentAt: now, result: lines }, { merge: true });
+    if (saveEntries.length) await releaseTopicNow(sp.topicId).catch(e => console.error('release after scheduled post:', e.message));
   } catch (err) {
     console.error('❌ Scheduled post failed:', docId, err.message);
     await ref.set({ status: 'failed', error: err.message, sentAt: now }, { merge: true }).catch(() => {});
