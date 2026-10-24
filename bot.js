@@ -441,9 +441,11 @@ async function shouldLinkVideoDefault(topicId) {
   const d = await db.collection('topics').doc(String(topicId)).get();
   if (!d.exists) return false;
   const t = d.data();
-  // ON by default (post time = video time). Only OFF when the video has already been unlocked by users,
-  // i.e. it is clearly public already and this schedule is a re-post. The admin can still flip the button.
-  return !(Number(t.unlockCount) > 0);
+  // A video that is CURRENTLY HIDDEN (held, or waiting for a publishAt) must default to ON — that is the
+  // whole point: it should appear at the post time, not before. Only a video that is already public has
+  // nothing to hide, so it defaults to OFF (re-post of an old video). The admin can still flip the button.
+  if (t.held === true || Number(t.publishAt) > Date.now()) return true;
+  return false;
 }
 function schedRepeatKeyboard(state) {
   return Markup.inlineKeyboard([
@@ -465,7 +467,7 @@ async function releaseTopicNow(topicId, onlyIfAt) {
   if (!held && !futureAt) return false;                   // already visible: nothing to do (no write, no index rebuild)
   if (onlyIfAt && !(futureAt && at === onlyIfAt)) return false; // someone set a different schedule meanwhile — leave it
   await ref.set({ publishAt: admin.firestore.FieldValue.delete(), held: admin.firestore.FieldValue.delete() }, { merge: true });
-  invalidateTopicsCache();
+  patchTopicCache(topicId, { publishAt: undefined, held: undefined });
   return true;
 }
 const publishTimers = new Map();
@@ -478,7 +480,8 @@ function armPublishTimer(id, at) {
   const h = setTimeout(() => {
     publishTimers.delete(id);
     if (at - Date.now() > 1000) return armPublishTimer(id, at); // setTimeout was clamped (long wait) — re-arm
-    scheduleTopicsIndexRebuild();
+    // Nothing to write here any more: the Cloudflare Worker and the Express API decide visibility from the clock
+    // (publishAt <= now), so the video appears by itself. The old index rebuild at this moment cost 1 write per video.
   }, Math.min(wait, 2147000000));
   publishTimers.set(id, { at, h });
 }
@@ -601,12 +604,28 @@ function invalidateTopicsCache() {
   scheduleTopicsIndexRebuild();
 }
 
+// 💸 READ-COST OPTIMISATION: when ONE topic changes in a known way (release / schedule: only `publishAt` and
+// `held` move) there is no need to throw the whole cache away — that made the index rebuild re-read the entire
+// `topics` collection (~234 reads) for a single video. Patch that one entry in memory instead (0 reads) and
+// rebuild the index from the cache. A patch value of `undefined` removes the field. Falls back to the full
+// invalidate whenever the cache is cold or the topic is not in it, so it can never serve wrong data.
+function patchTopicCache(id, patch) {
+  const key = String(id);
+  const t = Array.isArray(topicsCache) ? topicsCache.find(x => x.id === key) : null;
+  if (!t) return invalidateTopicsCache();
+  for (const [k, v] of Object.entries(patch || {})) { if (v === undefined) delete t[k]; else t[k] = v; }
+  singleTopicCache.delete(key);
+  singleTopicRefresh.delete(key);
+  scheduleTopicsIndexRebuild();
+}
+
 // 🚀 READ-COST FIX: the Cloudflare Worker serves the public topic list. It
 // used to scan the whole `topics` collection (~188 reads) on every cache miss.
 // Now we keep ONE compact doc (`system/topicsIndex`) with the card data
 // (no videos) and rebuild it whenever an admin changes topics (debounced, so
 // bulk edits cost a single rebuild). The Worker reads just that 1 doc.
 let topicsIndexTimer = null;
+let lastTopicsIndexJson = null; // null after boot => the first rebuild always writes (keeps the self-heal behaviour)
 function scheduleTopicsIndexRebuild() {
   if (topicsIndexTimer) clearTimeout(topicsIndexTimer);
   topicsIndexTimer = setTimeout(() => {
@@ -665,8 +684,12 @@ async function rebuildTopicsIndex() {
   const nowTs = Date.now();
   topics.forEach(t => { if (Number(t.publishAt) > nowTs) armPublishTimer(t.id, Number(t.publishAt)); });
   const isHiddenTopic = (t) => Number(t.publishAt) > nowTs || t.held === true;
-  const visibleTopics = topics.filter(t => !isHiddenTopic(t));
-  const cards = (visibleTopics.length ? visibleTopics : topics).map(t => ({
+  // ⏱️ The index now carries hidden/scheduled cards too, marked with `held` / `publishAt`. The Cloudflare
+  // Worker filters them out per request against ITS clock — so a scheduled video appears at exactly its time
+  // even if this Render bot is asleep or restarted (no timer, no rebuild needed to reveal it).
+  const cards = topics.map(t => ({
+    ...(t.held === true ? { held: true } : {}),
+    ...(Number(t.publishAt) > nowTs ? { publishAt: Number(t.publishAt) } : {}),
     id: t.id,
     title: t.title || '',
     thumbnail: t.thumbnail || '',
@@ -686,7 +709,10 @@ async function rebuildTopicsIndex() {
   }));
   // `cardsJson` = the same list as ONE string: the Cloudflare Worker reads it with a
   // single JSON.parse instead of decoding ~234 typed Firestore maps (slow / CPU heavy).
-  await db.collection('system').doc('topicsIndex').set({ cards, cardsJson: JSON.stringify(cards), updatedAt: Date.now() });
+  const cardsJson = JSON.stringify(cards);
+  if (cardsJson === lastTopicsIndexJson) { console.log('🗂️ topicsIndex unchanged — write skipped'); return; } // saves 1 write per no-op rebuild
+  await db.collection('system').doc('topicsIndex').set({ cards, cardsJson, updatedAt: Date.now() });
+  lastTopicsIndexJson = cardsJson;
   console.log(`🗂️ topicsIndex rebuilt (${cards.length} topics)`);
 }
 // Always rebuilds on startup (not just "if missing") so a bad/bloated
@@ -2936,13 +2962,18 @@ bot.action(/^sched_repeat:(none|daily|weekly)$/, async (ctx) => {
     delete postData[userId];
     schedulePostTimer(docRef.id, parsed - Date.now());
     let linkedNote = '\n📺 Video এখনই Mini App-এ দেখা যাচ্ছে।';
+    // link OFF: leave the video exactly as it is. A hidden video stays hidden and is released automatically
+    // when this scheduled post actually goes out (see the release after the scheduled send).
     if (!state.linkVideo && state.topicId) {
-      try { await releaseTopicNow(state.topicId); } catch (e) { console.error('release (link off):', e.message); }
+      try {
+        const td = await db.collection('topics').doc(String(state.topicId)).get();
+        if (td.exists && td.data().held === true) linkedNote = '\n🙈 Video লুকানো থাকবে — Channel-এ Post যাওয়ার সাথে সাথে Mini App-এ আসবে।';
+      } catch (e) {}
     }
     if (state.linkVideo && state.topicId) {
       try {
         await db.collection('topics').doc(String(state.topicId)).set({ publishAt: parsed, held: admin.firestore.FieldValue.delete() }, { merge: true });
-        invalidateTopicsCache();
+        patchTopicCache(state.topicId, { publishAt: parsed, held: undefined });
         armPublishTimer(String(state.topicId), parsed);
         linkedNote = '\n📺 Video-ও এই সময়েই Mini App-এ প্রকাশ হবে (তার আগে লুকানো)।';
       } catch (e) { console.error('link video schedule failed:', e.message); linkedNote = '\n⚠️ Video schedule করা যায়নি — video আগের মতোই দেখা যাবে।'; }
@@ -3330,6 +3361,89 @@ bot.action(/^hv_time:(.+)$/, async (ctx) => {
 });
 // ============ /HIDDEN / SCHEDULED VIDEOS ============
 
+// ============ 📊 VIP UNLOCK REPORT ============
+// Which active VIP unlocked how many videos. Data comes from `vipUnlocks` ("<ms>|<topicId>", last 200) and
+// `vipUnlockCount` (running total) written on every VIP unlock. One on-demand query over active VIPs only.
+function parseVipLog(d) {
+  return (Array.isArray(d.vipUnlocks) ? d.vipUnlocks : []).map(x => {
+    const i = String(x).indexOf('|');
+    return i > 0 ? { t: Number(String(x).slice(0, i)), id: String(x).slice(i + 1) } : null;
+  }).filter(e => e && Number.isFinite(e.t));
+}
+function vipCounts(d) {
+  const log = parseVipLog(d);
+  const now = Date.now();
+  const dayStart = Math.floor((now + 6 * 3600000) / 86400000) * 86400000 - 6 * 3600000; // Dhaka midnight
+  return {
+    log,
+    today: log.filter(e => e.t >= dayStart).length,
+    week: log.filter(e => e.t >= now - 7 * 86400000).length,
+    total: Math.max(Number(d.vipUnlockCount) || 0, log.length)
+  };
+}
+function vipName(d) {
+  return d.firstName || d.first_name || d.vipName || d.vipPayerName || d.username || d.vipUsername || 'নাম নেই';
+}
+
+let vipReportCache = null; // { at, rows } — 60s, so opening / going Back does not re-read every VIP each time
+async function vipUnlockReport(ctx, force) {
+  try {
+    const now = Date.now();
+    const back = [Markup.button.callback('⬅️ Back', 'adm_vip')];
+    let rows;
+    if (!force && vipReportCache && now - vipReportCache.at < 60000) {
+      rows = vipReportCache.rows.map(r => ({ ...r, c: vipCounts(r.d) }));
+    } else {
+      const snap = await db.collection('users').where('subscriptionExpiresAt', '>', now).get();
+      if (snap.empty) { vipReportCache = { at: now, rows: [] }; return ctx.reply('📊 এই মুহূর্তে কোনো active VIP নেই।', Markup.inlineKeyboard([back])); }
+      rows = snap.docs.map(doc => ({ id: doc.id, d: doc.data(), c: vipCounts(doc.data()) }));
+      vipReportCache = { at: now, rows: rows.map(r => ({ id: r.id, d: r.d })) };
+    }
+    if (!rows.length) return ctx.reply('📊 এই মুহূর্তে কোনো active VIP নেই।', Markup.inlineKeyboard([back]));
+    rows = rows
+      .sort((a, b) => (b.c.today - a.c.today) || (b.c.week - a.c.week) || (b.c.total - a.c.total));
+    const sumToday = rows.reduce((n, r) => n + r.c.today, 0);
+    const sumWeek = rows.reduce((n, r) => n + r.c.week, 0);
+    const MAX = 40;
+    let text = `📊 VIP UNLOCK REPORT (${rows.length} জন VIP)\n🎬 সবার মোট — আজ: ${sumToday} | ৭ দিনে: ${sumWeek}\n\n`;
+    const kbRows = [];
+    rows.slice(0, MAX).forEach((r, i) => {
+      text += `${i + 1}. 👤 ${escapeHtml(vipName(r.d))}${r.d.username ? ' (@' + escapeHtml(r.d.username) + ')' : ''}\n    🎬 আজ: ${r.c.today} | ৭ দিনে: ${r.c.week} | মোট: ${r.c.total}\n`;
+      kbRows.push([Markup.button.callback(`🔎 ${i + 1}. ${safeTruncate(vipName(r.d), 22)} — কোন কোন video`, `vipu:${r.id}`)]);
+    });
+    if (rows.length > MAX) text += `\n…আরও ${rows.length - MAX} জন আছে।`;
+    text += '\n\nℹ️ হিসাব শুধু এই update-এর পর থেকে জমা হচ্ছে (আগের unlock-এর তথ্য নেই)।';
+    kbRows.push([Markup.button.callback('🔄 Refresh (নতুন data)', 'adm_vip_report_fresh')]);
+    kbRows.push(back);
+    // chunk-safe: 40 rows × ~110 chars stays under Telegram's 4096 limit
+    return ctx.reply(text.slice(0, 4000), { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard(kbRows).reply_markup });
+  } catch (e) {
+    console.error('vip report error:', e.message);
+    return ctx.reply('❌ Report আনতে সমস্যা: ' + e.message);
+  }
+}
+
+bot.action(/^vipu:(\d+)$/, async (ctx) => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  try { await ctx.answerCbQuery(); } catch (e) {}
+  try {
+    const uid = ctx.match[1];
+    const doc = await db.collection('users').doc(uid).get();
+    if (!doc.exists) return ctx.reply('❌ User পাওয়া যায়নি।');
+    const d = doc.data();
+    const c = vipCounts(d);
+    const topics = await getTopicsCached();
+    const titleOf = new Map(topics.map(t => [t.id, t.title || 'নামবিহীন']));
+    const last = c.log.slice(-25).reverse();
+    let text = `🔎 ${escapeHtml(vipName(d))}${d.username ? ' (@' + escapeHtml(d.username) + ')' : ''}\n🆔 <code>${uid}</code>\n🎬 আজ: ${c.today} | ৭ দিনে: ${c.week} | মোট: ${c.total}\n\n`;
+    text += last.length
+      ? '🕒 সর্বশেষ unlock (নতুন আগে):\n' + last.map((e, i) => `${i + 1}. ${escapeHtml(safeTruncate(titleOf.get(e.id) || '(মুছে ফেলা video)', 40))}\n    ${formatDhakaDateTime(e.t)}`).join('\n')
+      : 'এখনো কোনো unlock রেকর্ড নেই।';
+    return ctx.reply(text.slice(0, 4000), { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('⬅️ Report', 'adm_vip_report')]]).reply_markup });
+  } catch (e) { return ctx.reply('❌ ' + e.message); }
+});
+// ============ /VIP UNLOCK REPORT ============
+
 bot.action(/^adm_(.+)$/, async (ctx) => {
   if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
   const action = ctx.match[1];
@@ -3364,6 +3478,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       [Markup.button.callback('🔧 দিন নির্দিষ্ট করে বসান', 'adm_vip_set')],
       [Markup.button.callback('🗑️ VIP বাদ দিন', 'adm_vip_remove')],
       [Markup.button.callback('📋 VIP List', 'adm_vip_list')],
+      [Markup.button.callback('📊 VIP Unlock Report', 'adm_vip_report')],
       [Markup.button.callback('⬅️ Back', 'adm_home')]
     ]));
   }
@@ -3384,6 +3499,12 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   }
   if (action === 'vip_list') {
     return listVipSubscriptions(ctx);
+  }
+  if (action === 'vip_report') {
+    return vipUnlockReport(ctx);
+  }
+  if (action === 'vip_report_fresh') {
+    return vipUnlockReport(ctx, true);
   }
   if (action === 'videos') {
     return ctx.editMessageText('🎬 VIDEO MANAGEMENT\n\nএখানে শুধু Video/Topic-এর নিজস্ব management থাকবে।\nPost ও Ads আলাদা Admin menu থেকে করা যাবে।', Markup.inlineKeyboard([
@@ -5153,7 +5274,7 @@ bot.on('text', async (ctx) => {
     if (text.trim().toLowerCase() === 'now') {
       delete updateAdsData[userId];
       await ref.set({ publishAt: admin.firestore.FieldValue.delete(), held: admin.firestore.FieldValue.delete() }, { merge: true });
-      invalidateTopicsCache();
+      patchTopicCache(tid, { publishAt: undefined, held: undefined });
       return ctx.reply('✅ Schedule বাতিল — video এখন থেকে Mini App-এ দেখাবে।', Markup.inlineKeyboard([[Markup.button.callback('🎬 Videos', 'adm_videos')]]));
     }
     const at = parseDhakaDateTime(text);
@@ -5162,7 +5283,7 @@ bot.on('text', async (ctx) => {
     delete updateAdsData[userId];
     // held must be cleared too — otherwise a "waiting for post" video stays hidden even after publishAt passes.
     await ref.set({ publishAt: at, held: admin.firestore.FieldValue.delete() }, { merge: true });
-    invalidateTopicsCache();
+    patchTopicCache(tid, { publishAt: at, held: undefined });
     armPublishTimer(tid, at);
     return ctx.reply(`✅ ${formatDhakaDateTime(at)} পর্যন্ত video লুকানো থাকবে, তারপর নিজে নিজে Mini App-এ আসবে।`, Markup.inlineKeyboard([[Markup.button.callback('🎬 Videos', 'adm_videos')]]));
   }
@@ -6098,7 +6219,9 @@ app.post('/api/ad-complete', async (req, res) => {
         vipUnlockedTopics.push(topicId);
         const vipTopicUnlockTime = { ...(data.topicUnlockTime || {}), [topicId]: Date.now() };
         const vipWatched = Array.from(new Set([...(data.watchedTopicIds || []), topicId])).slice(-300);
-        tx.set(userRef, { unlockedTopics: vipUnlockedTopics, topicUnlockTime: vipTopicUnlockTime, watchedTopicIds: vipWatched }, { merge: true });
+        const vipLog = (Array.isArray(data.vipUnlocks) ? data.vipUnlocks : []).slice(-199);
+        vipLog.push(`${Date.now()}|${topicId}`);
+        tx.set(userRef, { unlockedTopics: vipUnlockedTopics, topicUnlockTime: vipTopicUnlockTime, watchedTopicIds: vipWatched, vipUnlocks: vipLog, vipUnlockCount: (Number(data.vipUnlockCount) || 0) + 1 }, { merge: true });
         return { count: required, required, unlocked: true, limitReached: false, dailyUsed: Number(data.dailyAdsUsed) || 0, adViewCounted: false, userState: { blocked: false, unlockedTopics: vipUnlockedTopics, topicUnlockTime: vipTopicUnlockTime, sentMessages: data.sentMessages, watchedTopicIds: vipWatched } };
       }
       const progress = { ...(data.adProgress || {}) };
@@ -6522,7 +6645,8 @@ async function listVipSubscriptions(ctx) {
       const who = `<a href="tg://user?id=${doc.id}">${shown}</a>${p.user ? ' (@' + escapeHtml(p.user) + ')' : ''}`;
       const payerLine = p.payer && p.payer !== p.first ? `\n   ✍️ পেমেন্টের নাম: ${escapeHtml(p.payer)}` : '';
       const buyLine = d.vipLastPrice ? `\n   💳 শেষ পেমেন্ট: ${escapeHtml(String(d.vipLastPrice))}৳${d.vipLastMethod ? ' (' + escapeHtml(d.vipLastMethod) + ')' : ''}` : '';
-      return `👤 ${who}\n   🆔 <code>${doc.id}</code>${payerLine}${buyLine}\n   ⏳ বাকি: ${daysLeft} দিন (শেষ: ${dateStr})`;
+      const vc = vipCounts(d);
+      return `👤 ${who}\n   🆔 <code>${doc.id}</code>${payerLine}${buyLine}\n   🎬 Unlock — আজ: ${vc.today} | ৭ দিনে: ${vc.week} | মোট: ${vc.total}\n   ⏳ বাকি: ${daysLeft} দিন (শেষ: ${dateStr})`;
     });
     const header = `📋 VIP LIST (${snap.size} জন)\n\n`;
     const kb = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'adm_vip')]]);
