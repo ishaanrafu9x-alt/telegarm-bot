@@ -313,6 +313,7 @@ function creditsView() {
     [Markup.button.callback('🏷 নাম বদলান', 'adm_cr_name'), Markup.button.callback('😀 আইকন বদলান', 'adm_cr_icon')],
     [Markup.button.callback(`➕➖ কোনো User-কে ${a.creditIcon} দিন / কাটুন`, 'adm_cr_give')],
     [Markup.button.callback('🔎 User-এর Balance দেখুন', 'adm_cr_bal')],
+    [Markup.button.callback('🔄 আসল কেনাকাটা Sync (শেষ ১৪ দিন)', 'adm_cr_sync')],
     [Markup.button.callback('⬅️ Back', 'adm_home')]
   ]);
   return { text, keyboard };
@@ -727,6 +728,7 @@ async function rebuildTopicsIndex() {
     // toward the size limit as more topics get added. Dropped entirely; no
     // functional change, since nothing used it.
     adsRequired: Number(t.adsRequired) || 0,
+    premiumOnly: t.premiumOnly === true, // 🔒 VIP/Credit-only video (no ad unlock)
     sortOrder: t.sortOrder,
     createdAt: t.createdAt || null,
     videoCount: Number(t.videoCount) || (Array.isArray(t.videos) ? t.videos.length : 0),
@@ -766,6 +768,7 @@ async function getSingleTopicCached(topicId) {
       title: data.title || 'নামবিহীন ভিডিও',
       thumbnail: data.thumbnail || '',
       adsRequired: Math.max(1, Number(data.adsRequired) || 1),
+      premiumOnly: data.premiumOnly === true,
       type: data.type || 'single',
       videoCount: Number(data.videoCount) || (Array.isArray(data.videos) ? data.videos.length : 0),
       unlockCount: Number(data.unlockCount) || 0,
@@ -3546,6 +3549,35 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
     if (action === 'cr_name') { updateAdsData[ctx.from.id] = { step: 'cfg_creditName' }; return ctx.reply('🏷 Credit-এর নাম লিখুন (যেমন: Diamond, Coin, Gem — সর্বোচ্চ ১৪ অক্ষর):'); }
     if (action === 'cr_icon') { updateAdsData[ctx.from.id] = { step: 'cfg_creditIcon' }; return ctx.reply('😀 একটা emoji পাঠান (যেমন: 💎 🪙 💰 ⭐):'); }
     if (action === 'cr_give') { updateAdsData[ctx.from.id] = { step: 'cfg_creditGiveId' }; return ctx.reply('➕➖ যে User-কে Credit দিতে/কাটতে চান তার Telegram User ID পাঠান:'); }
+    if (action === 'cr_sync') {
+      // Copies REAL, admin-approved payment orders (VIP + Credit) from the last 14 days into the Mini App ticker. Nothing is invented.
+      await ctx.answerCbQuery('⏳ Sync হচ্ছে…').catch(() => {});
+      try {
+        const cutoff = Date.now() - 14 * 24 * 3600 * 1000;
+        const snap = await db.collection('paymentOrders').where('approvedAt', '>=', cutoff).get();
+        const ref = db.collection('system').doc('recentPurchases');
+        const cur = await ref.get();
+        let list = []; try { list = JSON.parse((cur.exists && cur.data().json) || '[]'); } catch (_) {}
+        const have = new Set(list.map(x => x && x.o).filter(Boolean));
+        let added = 0;
+        snap.forEach(d => {
+          const o = d.data() || {};
+          if (o.status !== 'approved') return;
+          const oid = o.orderId || d.id;
+          if (have.has(oid)) return;
+          let nm = o.payerName || o.firstName || '';
+          nm = nm ? Array.from(String(nm).trim())[0] + '***' : 'User';
+          const e = o.kind === 'credits' ? { c: Math.floor(Number(o.credits) || 0) } : { v: Number(o.totalDays) || 0 };
+          if (!e.c && !e.v) return;
+          list.push({ n: nm, p: Number(o.price) || 0, at: Number(o.approvedAt) || Date.now(), o: oid, ...e });
+          added++;
+        });
+        list.sort((a, b) => a.at - b.at);
+        await ref.set({ json: JSON.stringify(list.slice(-30)), updatedAt: Date.now() }, { merge: true });
+        await ctx.reply('✅ Sync শেষ: ' + added + 'টি আসল কেনাকাটা যোগ হয়েছে। (Mini App-এ ~১ মিনিটে দেখা যাবে)');
+      } catch (e) { await ctx.reply('❌ Sync করা যায়নি: ' + e.message); }
+      return;
+    }
     if (action === 'cr_bal') { updateAdsData[ctx.from.id] = { step: 'cfg_creditBalId' }; return ctx.reply('🔎 User ID পাঠান:'); }
     return;
   }
@@ -3978,8 +4010,9 @@ bot.action(/^aview:(.+)$/, async ctx=>{
   const id=ctx.match[1]; const doc=await db.collection('topics').doc(id).get();
   if(!doc.exists) return ctx.answerCbQuery('❌ Video পাওয়া যায়নি');
   const t=doc.data(); await ctx.answerCbQuery();
-  return ctx.editMessageText(`🎬 VIDEO DETAILS\n\n📌 <code>${escapeHtml(t.title||'নামবিহীন')}</code>\n🆔 <code>${escapeHtml(id)}</code>\n📹 Videos: ${t.videoCount||0}\n🎯 Ads: ${t.adsRequired||1}\n👁️ Views: ${Number(t.unlockCount||0)}`,{ parse_mode: 'HTML', ...Markup.inlineKeyboard([
+  return ctx.editMessageText(`🎬 VIDEO DETAILS\n\n📌 <code>${escapeHtml(t.title||'নামবিহীন')}</code>\n🆔 <code>${escapeHtml(id)}</code>\n📹 Videos: ${t.videoCount||0}\n🎯 Ads: ${t.adsRequired||1}\n🔐 Access: ${t.premiumOnly===true?'💎 শুধু VIP/Credit':'🌍 সবাই (Ads)'}\n👁️ Views: ${Number(t.unlockCount||0)}`,{ parse_mode: 'HTML', ...Markup.inlineKeyboard([
     [Markup.button.callback('✏️ Rename','av_rename:'+id),Markup.button.callback('🖼️ Thumbnail','av_thumb:'+id)],
+    [Markup.button.callback(t.premiumOnly===true?'🌍 সবার জন্য করুন':'🔒 শুধু VIP/Credit করুন','av_prem:'+id)],
     [Markup.button.callback('🎯 Ads','av_ads:'+id),Markup.button.callback('📤 Post','apost_topic:'+id)],
     [Markup.button.callback('🖼️ Thumbnail + Title Post','apost_thumb:'+id)],
     [Markup.button.callback('📼 Video যুক্ত করুন','av_append:'+id),Markup.button.callback('🧬 Duplicate','av_duplicate:'+id)],
@@ -5105,9 +5138,8 @@ bot.on('text', async (ctx) => {
       const ads = Number.parseInt(text, 10);
       if (!Number.isInteger(ads) || ads < 1) return ctx.reply('❌ দয়া করে ১ বা তার বেশি একটি সংখ্যা দিন:');
       data.adsRequired = ads;
-      await saveTopic(ctx, data);
-      delete addTopicData[userId];
-      return;
+      data.step = 'access';
+      return askAccessType(ctx, 'topic');
     }
   }
   if (addVideoData[userId]) {
@@ -5121,9 +5153,8 @@ bot.on('text', async (ctx) => {
       const ads = Number.parseInt(text, 10);
       if (!Number.isInteger(ads) || ads < 1) return ctx.reply('❌ দয়া করে ১ বা তার বেশি একটি সংখ্যা দিন:');
       data.adsRequired = ads;
-      await saveVideo(ctx, data);
-      delete addVideoData[userId];
-      return;
+      data.step = 'access';
+      return askAccessType(ctx, 'video');
     }
   }
 
@@ -5717,6 +5748,40 @@ bot.on('photo', async (ctx) => {
 });
 
 // =============================================
+// 🔒 ACCESS TYPE (Free-with-Ads  vs  VIP/Credit only)
+// =============================================
+function askAccessType(ctx, kind) {
+  return ctx.reply('🔐 এই ' + (kind === 'topic' ? 'টপিক' : 'ভিডিও') + ' কারা unlock করতে পারবে?', Markup.inlineKeyboard([
+    [Markup.button.callback('🌍 সবাই (Ads দেখে)', 'acc:free')],
+    [Markup.button.callback('💎 শুধু VIP / Credit', 'acc:vip')]
+  ]));
+}
+bot.action(/^acc:(free|vip)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌');
+  const uid = ctx.from.id;
+  const premium = ctx.match[1] === 'vip';
+  const isTopic = !!(addTopicData[uid] && addTopicData[uid].step === 'access');
+  const isVideo = !!(addVideoData[uid] && addVideoData[uid].step === 'access');
+  if (!isTopic && !isVideo) return ctx.answerCbQuery('⌛ সেশন শেষ, আবার শুরু করুন');
+  await ctx.answerCbQuery();
+  try { await ctx.editMessageText(premium ? '🔒 ঠিক আছে: শুধু VIP / Credit' : '🌍 ঠিক আছে: সবাই (Ads দেখে)'); } catch (e) {}
+  if (isTopic) { const d = addTopicData[uid]; d.premiumOnly = premium; await saveTopic(ctx, d); delete addTopicData[uid]; }
+  else { const d = addVideoData[uid]; d.premiumOnly = premium; await saveVideo(ctx, d); delete addVideoData[uid]; }
+});
+bot.action(/^av_prem:(.+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌');
+  const id = ctx.match[1];
+  const ref = db.collection('topics').doc(id);
+  const doc = await ref.get();
+  if (!doc.exists) return ctx.answerCbQuery('❌ Video পাওয়া যায়নি');
+  const now = doc.data().premiumOnly !== true;
+  await ref.update({ premiumOnly: now, updatedAt: new Date().toISOString() });
+  invalidateTopicsCache();
+  await ctx.answerCbQuery(now ? '🔒 এখন শুধু VIP/Credit' : '🌍 এখন সবাই Ads দেখে unlock করতে পারবে');
+  return ctx.reply(now ? '🔒 ভিডিওটি এখন শুধু VIP / Credit-এর জন্য।' : '🌍 ভিডিওটি এখন সবার জন্য (Ads দেখে unlock)।\n\n⬅️ ভিডিও ডিটেইলস আবার খুলতে লিস্ট থেকে ভিডিও বেছে নিন।');
+});
+
+// =============================================
 // 💾 SAVE HELPERS
 // =============================================
 
@@ -5728,6 +5793,7 @@ async function saveTopic(ctx, data) {
       thumbnail: data.thumbnail,
       videos: data.videos,
       adsRequired: data.adsRequired,
+      ...(data.premiumOnly ? { premiumOnly: true } : {}),
       type: 'multi',
       videoCount: data.videos.length,
       unlockCount: 0,
@@ -5755,6 +5821,7 @@ async function saveVideo(ctx, data) {
       thumbnail: data.thumbnail,
       videos: [data.videoId],
       adsRequired: data.adsRequired,
+      ...(data.premiumOnly ? { premiumOnly: true } : {}),
       type: 'single',
       videoCount: 1,
       unlockCount: 0,
@@ -6291,6 +6358,10 @@ app.post('/api/ad-complete', async (req, res) => {
     const cachedTopic = await getSingleTopicCached(topicId);
     if (!cachedTopic) return res.status(404).json({ error: 'Topic not found' });
     const required = Math.max(1, Number(cachedTopic.adsRequired) || 1);
+    if (cachedTopic.premiumOnly === true) {
+      // 🔒 VIP/Credit-only: ad unlock is not allowed (VIP is handled by the live worker.js path)
+      return res.status(403).json({ success: false, error: '🔒 এই ভিডিও শুধু VIP বা Credit দিয়ে unlock হবে।' });
+    }
 
     const userRef = db.collection('users').doc(userId);
 
