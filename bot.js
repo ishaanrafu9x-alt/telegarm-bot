@@ -252,7 +252,7 @@ let THIRTY_MINUTES = 30 * 60 * 1000; // now adjustable: Admin Panel -> Settings 
 
 // ============ ⚙️ APP SETTINGS (Admin Panel -> Settings) ============
 // One JSON string stored in system/adSettings.appJson (same doc the Worker already reads, so 0 extra reads).
-const APP_DEFAULTS = { announceOn: false, announce: '', maintOn: false, maint: '', hero: true, search: true, protect: true, unlockMin: 30, welcome: '', vipUrl: '', offerOn: false, offerTitle: '', offerText: '', offerCode: '', offerUntil: 0, autoDigest: false, holdNew: true };
+const APP_DEFAULTS = { announceOn: false, announce: '', maintOn: false, maint: '', hero: true, search: true, protect: true, unlockMin: 30, welcome: '', vipUrl: '', offerOn: false, offerTitle: '', offerText: '', offerCode: '', offerUntil: 0, autoDigest: false, holdNew: true, creditsOn: true, creditsPerAd: 5, creditName: 'Diamond', creditIcon: '💎' };
 let appSettings = { ...APP_DEFAULTS };
 function sanitizeApp(o) {
   o = o && typeof o === 'object' ? o : {};
@@ -270,6 +270,12 @@ function sanitizeApp(o) {
   if (typeof o.vipUrl === 'string' && /^https:\/\/(t|telegram)\.me\/[\w\-\/?=&.]{2,120}$/i.test(o.vipUrl.trim())) c.vipUrl = o.vipUrl.trim();
   const m = Number(o.unlockMin);
   if (Number.isFinite(m) && m >= 1 && m <= 1440) c.unlockMin = Math.round(m);
+  // 💎 Credit system (read by the Cloudflare Worker from the same appJson)
+  if (typeof o.creditsOn === 'boolean') c.creditsOn = o.creditsOn;
+  const cpa = Number(o.creditsPerAd);
+  if (Number.isFinite(cpa) && cpa >= 1 && cpa <= 10000) c.creditsPerAd = Math.round(cpa);
+  if (typeof o.creditName === 'string' && o.creditName.trim()) c.creditName = o.creditName.trim().slice(0, 14);
+  if (typeof o.creditIcon === 'string' && o.creditIcon.trim()) c.creditIcon = o.creditIcon.trim().slice(0, 4);
   return c;
 }
 function applyAppSettings(o) {
@@ -291,6 +297,26 @@ async function saveAppSettings(patch) {
   return next;
 }
 function heldNote() { return appSettings.holdNew ? '\n🙈 Post না করা পর্যন্ত এটা Mini App-এ লুকানো থাকবে।' : ''; }
+function creditsView() {
+  const a = appSettings, st = a.creditsOn ? '🟢 ON' : '🔴 OFF';
+  const text =
+    `${a.creditIcon} CREDIT SYSTEM\n\n` +
+    `Status: ${st}\n` +
+    `Currency নাম/আইকন: ${a.creditIcon} ${a.creditName}\n` +
+    `১টি Ad = ${a.creditsPerAd} ${a.creditIcon}\n` +
+    `(যে ভিডিওতে ৩টি Ad লাগে সেটার দাম = ${a.creditsPerAd * 3} ${a.creditIcon})\n\n` +
+    `💳 ${a.creditName} প্যাকেজ ও দাম (কত ${a.creditIcon} কত টাকায়) বদলাতে Payment Bot-এ গিয়ে /admin → 💎 Credit Packages চাপুন।\n` +
+    `⏱ পরিবর্তন Mini App-এ ~১ মিনিটে কার্যকর হবে।`;
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback(a.creditsOn ? '🔴 Credit বন্ধ করুন' : '🟢 Credit চালু করুন', 'adm_cr_toggle')],
+    [Markup.button.callback(`✏️ ১টি Ad = কত ${a.creditIcon}? (এখন ${a.creditsPerAd})`, 'adm_cr_perad')],
+    [Markup.button.callback('🏷 নাম বদলান', 'adm_cr_name'), Markup.button.callback('😀 আইকন বদলান', 'adm_cr_icon')],
+    [Markup.button.callback(`➕➖ কোনো User-কে ${a.creditIcon} দিন / কাটুন`, 'adm_cr_give')],
+    [Markup.button.callback('🔎 User-এর Balance দেখুন', 'adm_cr_bal')],
+    [Markup.button.callback('⬅️ Back', 'adm_home')]
+  ]);
+  return { text, keyboard };
+}
 function minLabel(m) { return m % 60 === 0 && m >= 60 ? `${m / 60} ঘণ্টা` : `${m} মিনিট`; }
 function appSettingsView() {
   const a = appSettings, st = (v) => (v ? '🟢 ON' : '🔴 OFF');
@@ -1836,6 +1862,7 @@ async function sendAdminPanel(ctx, edit = false) {
     [Markup.button.callback('💰 Revenue', 'adm_revenue'), Markup.button.callback('📦 Export Data', 'adm_export')],
     [Markup.button.callback('🕒 Scheduled Posts', 'adm_scheduled'), Markup.button.callback('📈 Reports', 'adm_reports')],
     [Markup.button.callback('👑 VIP Subscription', 'adm_vip'), Markup.button.callback('⚙️ Settings', 'adm_cfg')],
+    [Markup.button.callback('💎 Credits', 'adm_credits')],
     [Markup.button.callback('⌨️ Keyboard Show', 'adm_kb_show'), Markup.button.callback('❌ Keyboard Hide', 'adm_kb_hide')]
   ]);
   const chatId = ctx.chat && ctx.chat.id;
@@ -3505,6 +3532,22 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   }
   if (action === 'vip_report_fresh') {
     return vipUnlockReport(ctx, true);
+  }
+  if (action === 'credits' || action.startsWith('cr_')) {
+    clearAdminWorkflow(ctx.from.id);
+    const showCr = async () => {
+      const v = creditsView();
+      try { return await ctx.editMessageText(v.text, v.keyboard); }
+      catch (e) { if (/not modified/i.test(e && e.message)) return; return ctx.reply(v.text, v.keyboard); }
+    };
+    if (action === 'credits') return showCr();
+    if (action === 'cr_toggle') { await saveAppSettings({ creditsOn: !appSettings.creditsOn }); return showCr(); }
+    if (action === 'cr_perad') { updateAdsData[ctx.from.id] = { step: 'cfg_creditsPerAd' }; return ctx.reply(`✏️ ১টি Ad-এর বদলে কত ${appSettings.creditIcon} কাটবে? (১ - ১০০০০ এর মধ্যে সংখ্যা লিখুন)\nএখন: ${appSettings.creditsPerAd}`); }
+    if (action === 'cr_name') { updateAdsData[ctx.from.id] = { step: 'cfg_creditName' }; return ctx.reply('🏷 Credit-এর নাম লিখুন (যেমন: Diamond, Coin, Gem — সর্বোচ্চ ১৪ অক্ষর):'); }
+    if (action === 'cr_icon') { updateAdsData[ctx.from.id] = { step: 'cfg_creditIcon' }; return ctx.reply('😀 একটা emoji পাঠান (যেমন: 💎 🪙 💰 ⭐):'); }
+    if (action === 'cr_give') { updateAdsData[ctx.from.id] = { step: 'cfg_creditGiveId' }; return ctx.reply('➕➖ যে User-কে Credit দিতে/কাটতে চান তার Telegram User ID পাঠান:'); }
+    if (action === 'cr_bal') { updateAdsData[ctx.from.id] = { step: 'cfg_creditBalId' }; return ctx.reply('🔎 User ID পাঠান:'); }
+    return;
   }
   if (action === 'videos') {
     return ctx.editMessageText('🎬 VIDEO MANAGEMENT\n\nএখানে শুধু Video/Topic-এর নিজস্ব management থাকবে।\nPost ও Ads আলাদা Admin menu থেকে করা যাবে।', Markup.inlineKeyboard([
@@ -5291,6 +5334,62 @@ bot.on('text', async (ctx) => {
   if (userId === ADMIN_ID && updateAdsData[userId] && String(updateAdsData[userId].step || '').startsWith('cfg_')) {
     const key = updateAdsData[userId].step.slice(4);
     const backKb = { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('⚙️ Settings', 'adm_cfg')]]).reply_markup };
+    if (key.startsWith('credit')) {
+      const crBack = { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('💎 Credits', 'adm_credits')]]).reply_markup };
+      const ic = appSettings.creditIcon;
+      if (key === 'creditsPerAd') {
+        const n = Number(text);
+        if (!Number.isInteger(n) || n < 1 || n > 10000) return ctx.reply('❌ ১ থেকে ১০০০০ এর মধ্যে পূর্ণ সংখ্যা লিখুন।');
+        delete updateAdsData[userId];
+        await saveAppSettings({ creditsPerAd: n });
+        return ctx.reply(`✅ এখন থেকে ১টি Ad = ${n} ${ic}।`, crBack);
+      }
+      if (key === 'creditName') {
+        delete updateAdsData[userId];
+        const saved = await saveAppSettings({ creditName: text.trim() });
+        return ctx.reply(`✅ নাম: ${saved.creditName}`, crBack);
+      }
+      if (key === 'creditIcon') {
+        delete updateAdsData[userId];
+        const saved = await saveAppSettings({ creditIcon: text.trim() });
+        return ctx.reply(`✅ আইকন: ${saved.creditIcon}`, crBack);
+      }
+      if (key === 'creditBalId') {
+        delete updateAdsData[userId];
+        if (!/^\d{3,15}$/.test(text.trim())) return ctx.reply('❌ সঠিক User ID দিন।', crBack);
+        const u = await db.collection('users').doc(text.trim()).get();
+        if (!u.exists) return ctx.reply('❌ এই ID-র কোনো User পাওয়া যায়নি।', crBack);
+        const d = u.data();
+        return ctx.reply(`🔎 ${text.trim()}\n${ic} Balance: ${Math.max(0, Math.floor(Number(d.credits) || 0))}\nমোট খরচ: ${Number(d.creditsSpent) || 0}\nমোট কেনা/পাওয়া: ${Number(d.creditsEarned) || 0}`, crBack);
+      }
+      if (key === 'creditGiveId') {
+        if (!/^\d{3,15}$/.test(text.trim())) return ctx.reply('❌ সঠিক User ID (শুধু সংখ্যা) দিন।');
+        const u = await db.collection('users').doc(text.trim()).get();
+        if (!u.exists) { delete updateAdsData[userId]; return ctx.reply('❌ এই ID-র কোনো User পাওয়া যায়নি (সে কি Bot/Mini App কখনো খুলেছে?)।', crBack); }
+        updateAdsData[userId] = { step: 'cfg_creditGiveAmt', target: text.trim() };
+        return ctx.reply(`কত ${ic}? যোগ করতে সংখ্যা (যেমন 50), কাটতে মাইনাস দিয়ে (যেমন -20)।\nএখন Balance: ${Math.max(0, Math.floor(Number(u.data().credits) || 0))}`);
+      }
+      if (key === 'creditGiveAmt') {
+        const n = Number(text);
+        const target = updateAdsData[userId] && updateAdsData[userId].target;
+        if (!target) { delete updateAdsData[userId]; return; }
+        if (!Number.isInteger(n) || n === 0 || Math.abs(n) > 1000000) return ctx.reply('❌ শূন্য ছাড়া পূর্ণ সংখ্যা লিখুন (যেমন 50 বা -20)।');
+        delete updateAdsData[userId];
+        const ref = db.collection('users').doc(target);
+        let after = 0;
+        await db.runTransaction(async (tx) => {
+          const snap = await tx.get(ref);
+          const cur = Math.max(0, Math.floor(Number((snap.data() || {}).credits) || 0));
+          after = Math.max(0, cur + n);
+          const patch = { credits: after };
+          if (n > 0) patch.creditsEarned = admin.firestore.FieldValue.increment(n);
+          tx.set(ref, patch, { merge: true });
+        });
+        if (n > 0) { try { await bot.telegram.sendMessage(target, `🎁 আপনার একাউন্টে ${n} ${ic} যোগ হয়েছে!\nএখন Balance: ${after} ${ic}`); } catch (_) {} }
+        return ctx.reply(`✅ ${target} → ${n > 0 ? '+' : ''}${n} ${ic}\nনতুন Balance: ${after}`, crBack);
+      }
+      return;
+    }
     if (key.startsWith('offer')) {
       const offer = (updateAdsData[userId] && updateAdsData[userId].offer) || {};
       if (key === 'offerTitle') { offer.title = text.slice(0, 60); updateAdsData[userId] = { step: 'cfg_offerText', offer }; return ctx.reply('✏️ ২) অফারের বর্ণনা লিখুন (সর্বোচ্চ ৩০০ অক্ষর)। যেমন: "৩০ দিনের VIP এখন কম দামে"'); }
