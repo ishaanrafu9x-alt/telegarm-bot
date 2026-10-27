@@ -252,7 +252,7 @@ let THIRTY_MINUTES = 30 * 60 * 1000; // now adjustable: Admin Panel -> Settings 
 
 // ============ ⚙️ APP SETTINGS (Admin Panel -> Settings) ============
 // One JSON string stored in system/adSettings.appJson (same doc the Worker already reads, so 0 extra reads).
-const APP_DEFAULTS = { announceOn: false, announce: '', maintOn: false, maint: '', hero: true, search: true, protect: true, unlockMin: 30, welcome: '', vipUrl: '', offerOn: false, offerTitle: '', offerText: '', offerCode: '', offerUntil: 0, autoDigest: false, holdNew: true, creditsOn: true, creditsPerAd: 5, creditName: 'Diamond', creditIcon: '💎' };
+const APP_DEFAULTS = { announceOn: false, announce: '', maintOn: false, maint: '', hero: true, search: true, protect: true, unlockMin: 30, welcome: '', vipUrl: '', offerOn: false, offerTitle: '', offerText: '', offerCode: '', offerUntil: 0, autoDigest: false, holdNew: true, creditsOn: true, creditsPerAd: 5, creditName: 'Diamond', creditIcon: '💎', adBonusOn: true, adBonusEvery: 15, adBonusCredits: 6 };
 let appSettings = { ...APP_DEFAULTS };
 function sanitizeApp(o) {
   o = o && typeof o === 'object' ? o : {};
@@ -274,6 +274,11 @@ function sanitizeApp(o) {
   if (typeof o.creditsOn === 'boolean') c.creditsOn = o.creditsOn;
   const cpa = Number(o.creditsPerAd);
   if (Number.isFinite(cpa) && cpa >= 1 && cpa <= 10000) c.creditsPerAd = Math.round(cpa);
+  if (typeof o.adBonusOn === 'boolean') c.adBonusOn = o.adBonusOn;
+  const abe = Number(o.adBonusEvery);
+  if (Number.isFinite(abe) && abe >= 1 && abe <= 1000) c.adBonusEvery = Math.round(abe);
+  const abc = Number(o.adBonusCredits);
+  if (Number.isFinite(abc) && abc >= 1 && abc <= 10000) c.adBonusCredits = Math.round(abc);
   if (typeof o.creditName === 'string' && o.creditName.trim()) c.creditName = o.creditName.trim().slice(0, 14);
   if (typeof o.creditIcon === 'string' && o.creditIcon.trim()) c.creditIcon = o.creditIcon.trim().slice(0, 4);
   return c;
@@ -305,11 +310,19 @@ function creditsView() {
     `Currency নাম/আইকন: ${a.creditIcon} ${a.creditName}\n` +
     `১টি Ad = ${a.creditsPerAd} ${a.creditIcon}\n` +
     `(যে ভিডিওতে ৩টি Ad লাগে সেটার দাম = ${a.creditsPerAd * 3} ${a.creditIcon})\n\n` +
+    `🎁 Ad Bonus: ${a.adBonusOn ? '🟢 ON' : '🔴 OFF'}\n` +
+    `প্রতি ${a.adBonusEvery}টা Ad দেখলে = +${a.adBonusCredits} ${a.creditIcon} ফ্রি (≈ ${Math.round((a.adBonusCredits / (a.adBonusEvery * a.creditsPerAd)) * 100)}% ফেরত)\n` +
+    `📊 Daily Ad Limit: ${dailyLimitCache}টা → একজন দিনে সর্বোচ্চ +${Math.floor((dailyLimitCache * a.adBonusCredits) / a.adBonusEvery)} ${a.creditIcon} বোনাস পেতে পারে\n` +
+    `(প্রতিটা Ad-এ বোনাস জমে, Topic unlock হওয়ার মুহূর্তে জমা বোনাস একসাথে যোগ হয়। যেমন ৩ Ad-এর Topic = ${Math.floor((3 * a.adBonusCredits) / a.adBonusEvery)} ${a.creditIcon})\n\n` +
     `💳 ${a.creditName} প্যাকেজ ও দাম (কত ${a.creditIcon} কত টাকায়) বদলাতে Payment Bot-এ গিয়ে /admin → 💎 Credit Packages চাপুন।\n` +
     `⏱ পরিবর্তন Mini App-এ ~১ মিনিটে কার্যকর হবে।`;
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback(a.creditsOn ? '🔴 Credit বন্ধ করুন' : '🟢 Credit চালু করুন', 'adm_cr_toggle')],
     [Markup.button.callback(`✏️ ১টি Ad = কত ${a.creditIcon}? (এখন ${a.creditsPerAd})`, 'adm_cr_perad')],
+    [Markup.button.callback(a.adBonusOn ? '🔴 Ad Bonus বন্ধ করুন' : '🟢 Ad Bonus চালু করুন', 'adm_cr_bonus_toggle')],
+    [Markup.button.callback(`🎁 কয়টা Ad-এ বোনাস? (এখন ${a.adBonusEvery})`, 'adm_cr_bonus_every')],
+    [Markup.button.callback(`🎁 বোনাস কত ${a.creditIcon}? (এখন ${a.adBonusCredits})`, 'adm_cr_bonus_amt')],
+    [Markup.button.callback(`📊 Daily Ad Limit বদলান (এখন ${dailyLimitCache})`, 'adm_daily_limit')],
     [Markup.button.callback('🏷 নাম বদলান', 'adm_cr_name'), Markup.button.callback('😀 আইকন বদলান', 'adm_cr_icon')],
     [Markup.button.callback(`➕➖ কোনো User-কে ${a.creditIcon} দিন / কাটুন`, 'adm_cr_give')],
     [Markup.button.callback('🔎 User-এর Balance দেখুন', 'adm_cr_bal')],
@@ -651,13 +664,24 @@ function patchTopicCache(id, patch) {
 // Now we keep ONE compact doc (`system/topicsIndex`) with the card data
 // (no videos) and rebuild it whenever an admin changes topics (debounced, so
 // bulk edits cost a single rebuild). The Worker reads just that 1 doc.
+// ⚠️ If the index rebuild ever fails (e.g. Firestore 1 MB doc limit) the Mini App list silently stops getting new
+// videos while channel-post links still work. Tell the admin (at most once an hour) instead of failing silently.
+let lastIndexAlertAt = 0;
+function alertIndexFailure(e) {
+  console.error('❌ topicsIndex rebuild error:', e && e.message);
+  if (Date.now() - lastIndexAlertAt < 60 * 60 * 1000) return;
+  lastIndexAlertAt = Date.now();
+  try {
+    bot.telegram.sendMessage(ADMIN_ID, '⚠️ Mini App-এর Video list আপডেট করা যায়নি, তাই নতুন ভিডিও list-এ দেখা নাও যেতে পারে।\nকারণ: ' + String((e && e.message) || e).slice(0, 300)).catch(() => {});
+  } catch (_) {}
+}
 let topicsIndexTimer = null;
 let lastTopicsIndexJson = null; // null after boot => the first rebuild always writes (keeps the self-heal behaviour)
 function scheduleTopicsIndexRebuild() {
   if (topicsIndexTimer) clearTimeout(topicsIndexTimer);
   topicsIndexTimer = setTimeout(() => {
     topicsIndexTimer = null;
-    rebuildTopicsIndex().catch(e => console.error('❌ topicsIndex rebuild error:', e.message));
+    rebuildTopicsIndex().catch(alertIndexFailure);
   }, 4000);
 }
 // Unlocks in the last 7 days (today + 6 previous Dhaka days). Uses the per-day
@@ -739,7 +763,9 @@ async function rebuildTopicsIndex() {
   // single JSON.parse instead of decoding ~234 typed Firestore maps (slow / CPU heavy).
   const cardsJson = JSON.stringify(cards);
   if (cardsJson === lastTopicsIndexJson) { console.log('🗂️ topicsIndex unchanged — write skipped'); return; } // saves 1 write per no-op rebuild
-  await db.collection('system').doc('topicsIndex').set({ cards, cardsJson, updatedAt: Date.now() });
+  // The duplicate `cards` array used to be stored next to `cardsJson` = double the size, closer to Firestore's 1 MB
+  // limit. The Worker reads `cardsJson`; dropping `cards` keeps the doc half the size.
+  await db.collection('system').doc('topicsIndex').set({ cardsJson, updatedAt: Date.now() });
   lastTopicsIndexJson = cardsJson;
   console.log(`🗂️ topicsIndex rebuilt (${cards.length} topics)`);
 }
@@ -1227,7 +1253,7 @@ function applyUnlockToCaches(topicId, count, lastTs) {
 const topicsIndexViewsTimer = setInterval(() => {
   if (!topicsIndexDirty) return;
   topicsIndexDirty = false;
-  rebuildTopicsIndex().catch(e => { topicsIndexDirty = true; console.error('❌ topicsIndex views refresh error:', e.message); });
+  rebuildTopicsIndex().catch(e => { topicsIndexDirty = true; alertIndexFailure(e); });
 }, 3 * 60 * 1000);
 if (typeof topicsIndexViewsTimer.unref === 'function') topicsIndexViewsTimer.unref();
 
@@ -3539,12 +3565,16 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   if (action === 'credits' || action.startsWith('cr_')) {
     clearAdminWorkflow(ctx.from.id);
     const showCr = async () => {
+      try { await getDailyAdLimit(); } catch (_) {}
       const v = creditsView();
       try { return await ctx.editMessageText(v.text, v.keyboard); }
       catch (e) { if (/not modified/i.test(e && e.message)) return; return ctx.reply(v.text, v.keyboard); }
     };
     if (action === 'credits') return showCr();
     if (action === 'cr_toggle') { await saveAppSettings({ creditsOn: !appSettings.creditsOn }); return showCr(); }
+    if (action === 'cr_bonus_toggle') { await saveAppSettings({ adBonusOn: !appSettings.adBonusOn }); return showCr(); }
+    if (action === 'cr_bonus_every') { updateAdsData[ctx.from.id] = { step: 'cfg_creditBonusEvery' }; return ctx.reply(`🎁 কয়টা Ad দেখলে বোনাস পাবে? (১ - ১০০০ এর মধ্যে সংখ্যা)\nএখন: ${appSettings.adBonusEvery}`); }
+    if (action === 'cr_bonus_amt') { updateAdsData[ctx.from.id] = { step: 'cfg_creditBonusAmt' }; return ctx.reply(`🎁 বোনাস হিসেবে কত ${appSettings.creditIcon} পাবে? (১ - ১০০০০ এর মধ্যে সংখ্যা)\nএখন: ${appSettings.adBonusCredits}`); }
     if (action === 'cr_perad') { updateAdsData[ctx.from.id] = { step: 'cfg_creditsPerAd' }; return ctx.reply(`✏️ ১টি Ad-এর বদলে কত ${appSettings.creditIcon} কাটবে? (১ - ১০০০০ এর মধ্যে সংখ্যা লিখুন)\nএখন: ${appSettings.creditsPerAd}`); }
     if (action === 'cr_name') { updateAdsData[ctx.from.id] = { step: 'cfg_creditName' }; return ctx.reply('🏷 Credit-এর নাম লিখুন (যেমন: Diamond, Coin, Gem — সর্বোচ্চ ১৪ অক্ষর):'); }
     if (action === 'cr_icon') { updateAdsData[ctx.from.id] = { step: 'cfg_creditIcon' }; return ctx.reply('😀 একটা emoji পাঠান (যেমন: 💎 🪙 💰 ⭐):'); }
@@ -5374,6 +5404,20 @@ bot.on('text', async (ctx) => {
         delete updateAdsData[userId];
         await saveAppSettings({ creditsPerAd: n });
         return ctx.reply(`✅ এখন থেকে ১টি Ad = ${n} ${ic}।`, crBack);
+      }
+      if (key === 'creditBonusEvery') {
+        const n = Number(text);
+        if (!Number.isInteger(n) || n < 1 || n > 1000) return ctx.reply('❌ ১ থেকে ১০০০ এর মধ্যে পূর্ণ সংখ্যা লিখুন।');
+        delete updateAdsData[userId];
+        await saveAppSettings({ adBonusEvery: n });
+        return ctx.reply(`✅ এখন থেকে প্রতি ${n}টা Ad দেখলে বোনাস পাবে।`, crBack);
+      }
+      if (key === 'creditBonusAmt') {
+        const n = Number(text);
+        if (!Number.isInteger(n) || n < 1 || n > 10000) return ctx.reply('❌ ১ থেকে ১০০০০ এর মধ্যে পূর্ণ সংখ্যা লিখুন।');
+        delete updateAdsData[userId];
+        await saveAppSettings({ adBonusCredits: n });
+        return ctx.reply(`✅ বোনাস এখন +${n} ${ic}।`, crBack);
       }
       if (key === 'creditName') {
         delete updateAdsData[userId];
