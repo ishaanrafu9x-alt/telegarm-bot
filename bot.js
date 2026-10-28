@@ -252,7 +252,7 @@ let THIRTY_MINUTES = 30 * 60 * 1000; // now adjustable: Admin Panel -> Settings 
 
 // ============ ⚙️ APP SETTINGS (Admin Panel -> Settings) ============
 // One JSON string stored in system/adSettings.appJson (same doc the Worker already reads, so 0 extra reads).
-const APP_DEFAULTS = { announceOn: false, announce: '', maintOn: false, maint: '', hero: true, search: true, protect: true, unlockMin: 30, welcome: '', vipUrl: '', offerOn: false, offerTitle: '', offerText: '', offerCode: '', offerUntil: 0, autoDigest: false, holdNew: true, creditsOn: true, creditsPerAd: 5, creditName: 'Diamond', creditIcon: '💎', adBonusOn: true, adBonusEvery: 15, adBonusCredits: 6 };
+const APP_DEFAULTS = { announceOn: false, announce: '', maintOn: false, maint: '', hero: true, search: true, protect: true, unlockMin: 30, welcome: '', vipUrl: '', offerOn: false, offerTitle: '', offerText: '', offerCode: '', offerUntil: 0, autoDigest: false, holdNew: true, creditsOn: true, creditsPerAd: 5, creditName: 'Diamond', creditIcon: '💎', adBonusOn: true, adBonusEvery: 15, adBonusCredits: 6, adBonusDailyMax: 20 };
 let appSettings = { ...APP_DEFAULTS };
 function sanitizeApp(o) {
   o = o && typeof o === 'object' ? o : {};
@@ -279,6 +279,8 @@ function sanitizeApp(o) {
   if (Number.isFinite(abe) && abe >= 1 && abe <= 1000) c.adBonusEvery = Math.round(abe);
   const abc = Number(o.adBonusCredits);
   if (Number.isFinite(abc) && abc >= 1 && abc <= 10000) c.adBonusCredits = Math.round(abc);
+  const abm = Number(o.adBonusDailyMax);
+  if (Number.isFinite(abm) && abm >= 0 && abm <= 100000) c.adBonusDailyMax = Math.round(abm);
   if (typeof o.creditName === 'string' && o.creditName.trim()) c.creditName = o.creditName.trim().slice(0, 14);
   if (typeof o.creditIcon === 'string' && o.creditIcon.trim()) c.creditIcon = o.creditIcon.trim().slice(0, 4);
   return c;
@@ -312,8 +314,10 @@ function creditsView() {
     `(যে ভিডিওতে ৩টি Ad লাগে সেটার দাম = ${a.creditsPerAd * 3} ${a.creditIcon})\n\n` +
     `🎁 Ad Bonus: ${a.adBonusOn ? '🟢 ON' : '🔴 OFF'}\n` +
     `প্রতি ${a.adBonusEvery}টা Ad দেখলে = +${a.adBonusCredits} ${a.creditIcon} ফ্রি (≈ ${Math.round((a.adBonusCredits / (a.adBonusEvery * a.creditsPerAd)) * 100)}% ফেরত)\n` +
-    `📊 Daily Ad Limit: ${dailyLimitCache}টা → একজন দিনে সর্বোচ্চ +${Math.floor((dailyLimitCache * a.adBonusCredits) / a.adBonusEvery)} ${a.creditIcon} বোনাস পেতে পারে\n` +
-    `(প্রতিটা Ad-এ বোনাস জমে, Topic unlock হওয়ার মুহূর্তে জমা বোনাস একসাথে যোগ হয়। যেমন ৩ Ad-এর Topic = ${Math.floor((3 * a.adBonusCredits) / a.adBonusEvery)} ${a.creditIcon})\n\n` +
+    `🧮 হিসাব: ${a.adBonusEvery} Ad = ${a.adBonusCredits} ${a.creditIcon} → ১ Ad = ${Math.round((a.adBonusCredits / a.adBonusEvery) * 100) / 100} ${a.creditIcon}\n` +
+    `🔒 Daily Bonus Limit (প্রতি User): ${a.adBonusDailyMax > 0 ? a.adBonusDailyMax + ' ' + a.creditIcon + '/দিন' : 'নেই (আনলিমিটেড)'}\n` +
+    `📊 Daily Ad Limit: ${dailyLimitCache}টা → Ad-এর হিসাবে সর্বোচ্চ +${Math.floor((dailyLimitCache * a.adBonusCredits) / a.adBonusEvery)} ${a.creditIcon}${a.adBonusDailyMax > 0 ? ', কিন্তু Bonus Limit-এ থেমে যাবে (বাস্তবে সর্বোচ্চ ' + Math.min(a.adBonusDailyMax, Math.floor((dailyLimitCache * a.adBonusCredits) / a.adBonusEvery)) + ')' : ''}\n` +
+    `(প্রতিটা Ad দেখার সাথে সাথেই ভাগের বোনাস পায়: ১ Ad = ${Math.round((a.adBonusCredits / a.adBonusEvery) * 100) / 100} ${a.creditIcon}। ভগ্নাংশ জমা থাকে, ১ পূর্ণ হলে ব্যালেন্সে যোগ হয়। যেমন ৩ Ad-এর Topic = ${Math.round(((3 * a.adBonusCredits) / a.adBonusEvery) * 100) / 100} ${a.creditIcon})\n\n` +
     `💳 ${a.creditName} প্যাকেজ ও দাম (কত ${a.creditIcon} কত টাকায়) বদলাতে Payment Bot-এ গিয়ে /admin → 💎 Credit Packages চাপুন।\n` +
     `⏱ পরিবর্তন Mini App-এ ~১ মিনিটে কার্যকর হবে।`;
   const keyboard = Markup.inlineKeyboard([
@@ -322,6 +326,8 @@ function creditsView() {
     [Markup.button.callback(a.adBonusOn ? '🔴 Ad Bonus বন্ধ করুন' : '🟢 Ad Bonus চালু করুন', 'adm_cr_bonus_toggle')],
     [Markup.button.callback(`🎁 কয়টা Ad-এ বোনাস? (এখন ${a.adBonusEvery})`, 'adm_cr_bonus_every')],
     [Markup.button.callback(`🎁 বোনাস কত ${a.creditIcon}? (এখন ${a.adBonusCredits})`, 'adm_cr_bonus_amt')],
+    [Markup.button.callback(`🔒 Daily Bonus Limit (এখন ${a.adBonusDailyMax > 0 ? a.adBonusDailyMax : 'নেই'})`, 'adm_cr_bonus_max')],
+    [Markup.button.callback('📈 আজকের Credit Report', 'adm_cr_report'), Markup.button.callback('📅 গতকালের Report', 'adm_cr_report_y')],
     [Markup.button.callback(`📊 Daily Ad Limit বদলান (এখন ${dailyLimitCache})`, 'adm_daily_limit')],
     [Markup.button.callback('🏷 নাম বদলান', 'adm_cr_name'), Markup.button.callback('😀 আইকন বদলান', 'adm_cr_icon')],
     [Markup.button.callback(`➕➖ কোনো User-কে ${a.creditIcon} দিন / কাটুন`, 'adm_cr_give')],
@@ -3574,6 +3580,31 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
     if (action === 'cr_toggle') { await saveAppSettings({ creditsOn: !appSettings.creditsOn }); return showCr(); }
     if (action === 'cr_bonus_toggle') { await saveAppSettings({ adBonusOn: !appSettings.adBonusOn }); return showCr(); }
     if (action === 'cr_bonus_every') { updateAdsData[ctx.from.id] = { step: 'cfg_creditBonusEvery' }; return ctx.reply(`🎁 কয়টা Ad দেখলে বোনাস পাবে? (১ - ১০০০ এর মধ্যে সংখ্যা)\nএখন: ${appSettings.adBonusEvery}`); }
+    if (action === 'cr_bonus_max') { updateAdsData[ctx.from.id] = { step: 'cfg_creditBonusMax' }; return ctx.reply(`🔒 একজন User দিনে সর্বোচ্চ কত ${appSettings.creditIcon} ফ্রি পাবে? (১ - ১০০০০০ এর সংখ্যা, ০ = কোনো limit নেই)\nএখন: ${appSettings.adBonusDailyMax}\n(দিন বদলায় বাংলাদেশ সময় রাত ১২টায়)`); }
+    if (action === 'cr_report' || action === 'cr_report_y') {
+      try {
+        const day = getDhakaDateKey(action === 'cr_report_y' ? new Date(Date.now() - 86400000) : new Date());
+        const snap = await db.collection('users').where('bonusDate', '==', day).limit(5000).get();
+        const ic = appSettings.creditIcon, cap = appSettings.adBonusDailyMax;
+        const rows = [];
+        snap.forEach(d => { const x = d.data(); const n = Math.floor(Number(x.bonusToday) || 0); if (n > 0) rows.push({ id: d.id, n, name: x.firstName || x.first_name || x.username || '' }); });
+        rows.sort((a, b) => b.n - a.n);
+        const total = rows.reduce((t, r) => t + r.n, 0);
+        const atCap = cap > 0 ? rows.filter(r => r.n >= cap).length : 0;
+        let t = `📈 Credit Report — ${day}${action === 'cr_report_y' ? ' (গতকাল)' : ' (আজ)'}\n\n` +
+          `👥 বোনাস পেয়েছে: ${rows.length} জন\n` +
+          `🎁 মোট বিলানো হয়েছে: ${total} ${ic}\n` +
+          `📊 গড়: ${rows.length ? Math.round((total / rows.length) * 100) / 100 : 0} ${ic}/জন\n` +
+          (cap > 0 ? `🔒 Limit (${cap}) ছুঁয়েছে: ${atCap} জন\n` : `🔒 Daily Bonus Limit: নেই\n`) +
+          `\n🏆 সবচেয়ে বেশি পেয়েছে (শীর্ষ ২০):\n`;
+        rows.slice(0, 20).forEach((r, i) => { t += `${i + 1}. ${r.name ? r.name + ' · ' : ''}${r.id} → ${r.n} ${ic}\n`; });
+        if (!rows.length) t += '(এই দিনে কেউ বোনাস পায়নি)\n';
+        if (rows.length > 20) t += `… আরও ${rows.length - 20} জন\n`;
+        t += `\nℹ️ শুধু বোনাস (Ad দেখে পাওয়া) ধরা হয়েছে, কেনা/Admin-দেওয়া নয়। ভগ্নাংশ জমা থাকলে সেটা ধরা হয়নি।`;
+        if (t.length > 3900) t = t.slice(0, 3900) + '…';
+        return ctx.reply(t, { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('💎 Credits', 'adm_credits')]]).reply_markup });
+      } catch (e) { return ctx.reply('❌ Report আনা যায়নি: ' + e.message); }
+    }
     if (action === 'cr_bonus_amt') { updateAdsData[ctx.from.id] = { step: 'cfg_creditBonusAmt' }; return ctx.reply(`🎁 বোনাস হিসেবে কত ${appSettings.creditIcon} পাবে? (১ - ১০০০০ এর মধ্যে সংখ্যা)\nএখন: ${appSettings.adBonusCredits}`); }
     if (action === 'cr_perad') { updateAdsData[ctx.from.id] = { step: 'cfg_creditsPerAd' }; return ctx.reply(`✏️ ১টি Ad-এর বদলে কত ${appSettings.creditIcon} কাটবে? (১ - ১০০০০ এর মধ্যে সংখ্যা লিখুন)\nএখন: ${appSettings.creditsPerAd}`); }
     if (action === 'cr_name') { updateAdsData[ctx.from.id] = { step: 'cfg_creditName' }; return ctx.reply('🏷 Credit-এর নাম লিখুন (যেমন: Diamond, Coin, Gem — সর্বোচ্চ ১৪ অক্ষর):'); }
@@ -5411,6 +5442,13 @@ bot.on('text', async (ctx) => {
         delete updateAdsData[userId];
         await saveAppSettings({ adBonusEvery: n });
         return ctx.reply(`✅ এখন থেকে প্রতি ${n}টা Ad দেখলে বোনাস পাবে।`, crBack);
+      }
+      if (key === 'creditBonusMax') {
+        const n = Number(text);
+        if (!Number.isInteger(n) || n < 0 || n > 100000) return ctx.reply('❌ ০ থেকে ১০০০০০ এর মধ্যে পূর্ণ সংখ্যা লিখুন (০ = limit নেই)।');
+        delete updateAdsData[userId];
+        await saveAppSettings({ adBonusDailyMax: n });
+        return ctx.reply(n > 0 ? `✅ এখন থেকে একজন User দিনে সর্বোচ্চ ${n} ${ic} বোনাস পাবে।` : '✅ Daily Bonus Limit তুলে দেওয়া হয়েছে (আনলিমিটেড)।', crBack);
       }
       if (key === 'creditBonusAmt') {
         const n = Number(text);
