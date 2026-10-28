@@ -885,12 +885,13 @@ function cleanupAdTokens() {
 // ---------- Ad network on/off switches (Ads Management → Ad Networks) ----------
 // Stored in Firestore system/adSettings. The Cloudflare Worker reads it (cached ~60s)
 // and the Mini App only uses the networks that are switched on.
-const AD_SETTING_DEFAULTS = { monetag: true, onclicka: true, gigapub: true, litebits: false, richads: false, richadsBanner: true };
+const AD_SETTING_DEFAULTS = { monetag: true, onclicka: true, gigapub: true, litebits: false, richads: false, adspark: true, richadsBanner: true };
 const AD_SETTING_LABELS = {
   monetag: 'Monetag',
   onclicka: 'OnClickA',
   gigapub: 'GigaPub',
   litebits: 'LiteBits',
+  adspark: 'AdSpark',
   richads: 'RichAds (unlock ad)',
   richadsBanner: 'RichAds Banner'
 };
@@ -1031,7 +1032,7 @@ bot.use(async (ctx, next) => {
   return next();
 });
 // ---------- ⚖️ Network weights (kon network koto ad pabe) + 🤖 Auto-pause (kharap network nijei OFF) ----------
-const UNLOCK_NET_KEYS = ['monetag', 'onclicka', 'gigapub', 'litebits', 'richads'];
+const UNLOCK_NET_KEYS = ['monetag', 'onclicka', 'gigapub', 'litebits', 'richads', 'adspark'];
 async function readNetWeights() {
   try {
     const d = await db.collection('system').doc('adWeights').get();
@@ -3815,7 +3816,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
     let custom = await readCustomNets();
     const auto = await readAutoPause();
     if (action === 'autopause') { auto.enabled = !auto.enabled; await writeAutoPause(auto); }
-    const builtinOn = (st) => ['monetag', 'onclicka', 'gigapub', 'litebits', 'richads'].some(n => st[n]);
+    const builtinOn = (st) => ['monetag', 'onclicka', 'gigapub', 'litebits', 'richads', 'adspark'].some(n => st[n]);
     if (action.startsWith('cnettoggle_') || action.startsWith('cnetdel_')) {
       const isDel = action.startsWith('cnetdel_');
       const id = action.slice(isDel ? 'cnetdel_'.length : 'cnettoggle_'.length);
@@ -3830,7 +3831,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       const key = action.slice('nettoggle_'.length);
       if (!Object.prototype.hasOwnProperty.call(AD_SETTING_DEFAULTS, key)) return;
       const next = { ...s, [key]: !s[key] };
-      const unlockNets = ['monetag', 'onclicka', 'gigapub', 'litebits', 'richads'];
+      const unlockNets = ['monetag', 'onclicka', 'gigapub', 'litebits', 'richads', 'adspark'];
       if (unlockNets.includes(key) && !unlockNets.some(n => next[n]) && !custom.some(c => c.enabled !== false)) {
         return ctx.answerCbQuery('⚠️ অন্তত একটা Ad Network চালু রাখতে হবে', { show_alert: true }).catch(() => {});
       }
@@ -3981,7 +3982,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       `💵 আনুমানিক আজকের আয় (estimate): ${estTodayRevenue.toFixed(2)} ৳\n`;
     // Per-network breakdown (recorded by the Cloudflare Worker): how many ads
     // each network REALLY served and how often it failed (no fill / SDK error).
-    const nets = [['monetag', 'Monetag'], ['onclicka', 'OnClickA'], ['gigapub', 'GigaPub'], ['litebits', 'LiteBits'], ['richads', 'RichAds']].concat((await readCustomNets()).map(c => [c.id, c.name]));
+    const nets = [['monetag', 'Monetag'], ['onclicka', 'OnClickA'], ['gigapub', 'GigaPub'], ['litebits', 'LiteBits'], ['richads', 'RichAds'], ['adspark', 'AdSpark']].concat((await readCustomNets()).map(c => [c.id, c.name]));
     text += `\n📡 Ad Network (served / failed)\n` + nets.map(([k, label]) =>
       `• ${label}: ${Number(stats.byNetwork[k]) || 0} / ${Number(stats.fails[k]) || 0}` + (stats.lastFail[k] ? `\n   ⚠️ last error: ${String(stats.lastFail[k]).slice(0, 90)}` : '')
     ).join('\n') + '\n';
@@ -6391,7 +6392,7 @@ async function deliverUnlockedTopicInner(userId, topicId, userStateHint) {
 let adNetworkRotationCounter = 0;
 function nextAdNetwork() {
   const current = adNetworkRotationCounter++;
-  const list = ['monetag', 'onclicka', 'gigapub', 'litebits', 'richads'];
+  const list = ['monetag', 'onclicka', 'gigapub', 'litebits', 'richads', 'adspark'];
   return list[current % list.length];
 }
 
