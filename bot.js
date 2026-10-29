@@ -516,6 +516,18 @@ async function releaseTopicNow(topicId, onlyIfAt) {
   patchTopicCache(topicId, { publishAt: undefined, held: undefined });
   return true;
 }
+// 🐛 FIX: a finished scheduled post used to release its video unconditionally. If the SAME video had a
+// LATER schedule (re-post of one video at 2 times), the first post's release made the video public
+// early and the second schedule's time meant nothing. Now a video that is waiting for a LATER time
+// stays hidden; a hidden-until-post video (`held`) or this post's own time is released as before.
+async function releaseTopicAfterScheduledPost(topicId, scheduledAt) {
+  if (!topicId) return false;
+  const d = await db.collection('topics').doc(String(topicId)).get();
+  if (!d.exists) return false;
+  const at = Number(d.data().publishAt) || 0;
+  if (at > Date.now() && at > (Number(scheduledAt) || 0) + 60 * 1000) return false; // belongs to a later schedule
+  return releaseTopicNow(topicId);
+}
 const publishTimers = new Map();
 function armPublishTimer(id, at) {
   const prev = publishTimers.get(id);
@@ -6998,6 +7010,16 @@ async function firePostSchedule(docId) {
   const channels = Array.isArray(sp.channels) && sp.channels.length ? sp.channels : (POST_CHANNEL ? [POST_CHANNEL] : []);
   const lines = [];
   const saveEntries = [];
+  // 🐛 FIX: if EVERY channel send failed the post used to be marked 'sent' anyway (no retry, vanished from the
+  // Scheduled list, nothing in the channel). Now it retries up to 3 more times (1 min apart) and tells the admin why.
+  const attempts = Number(sp.attempts) || 0;
+  const retryLater = async (why) => {
+    if (attempts >= 3) return false;
+    await ref.set({ status: 'pending', attempts: attempts + 1, lastError: String(why).slice(0, 400) }, { merge: true });
+    schedulePostTimer(docId, 60 * 1000);
+    if (ADMIN_ID) await safeSendMessage(ADMIN_ID, `⚠️ Scheduled Post যায়নি (চেষ্টা ${attempts + 1}/4) — ১ মিনিট পর আবার চেষ্টা হবে।\n\n${escapeHtml(String(why).slice(0, 600))}`, { parse_mode: 'HTML' }).catch(() => {});
+    return true;
+  };
   try {
     const keyboard = await buildConfiguredPostKeyboard(sp.topicId);
     for (const channelId of channels) {
@@ -7015,10 +7037,12 @@ async function firePostSchedule(docId) {
         lines.push(`❌ ${channelId} — ${chErr.message}`);
       }
     }
-    await ref.set({ status: 'sent', sentAt: now, result: lines }, { merge: true });
-    if (saveEntries.length) await releaseTopicNow(sp.topicId).catch(e => console.error('release after scheduled post:', e.message));
+    if (!saveEntries.length && channels.length) { if (await retryLater(lines.join('\n'))) return; }
+    await ref.set({ status: (saveEntries.length || !channels.length) ? 'sent' : 'failed', sentAt: now, result: lines }, { merge: true });
+    if (saveEntries.length) await releaseTopicAfterScheduledPost(sp.topicId, Number(sp.scheduledAt)).catch(e => console.error('release after scheduled post:', e.message));
   } catch (err) {
     console.error('❌ Scheduled post failed:', docId, err.message);
+    if (await retryLater(err.message).catch(() => false)) return;
     await ref.set({ status: 'failed', error: err.message, sentAt: now }, { merge: true }).catch(() => {});
     lines.push(`❌ সম্পূর্ণ ব্যর্থ: ${err.message}`);
   }
@@ -7054,9 +7078,39 @@ function schedulePostTimer(docId, delayMs) {
   const remaining = delayMs - chunk;
   const handle = setTimeout(() => {
     if (remaining > 0) schedulePostTimer(docId, remaining);
-    else firePostSchedule(docId).catch(e => console.error('❌ firePostSchedule error:', e.message));
+    else enqueuePostFire(docId);
   }, chunk);
   scheduledTimers.set(docId, handle);
+}
+
+// 🐛 FIX (many videos scheduled for the same minute got mixed up / sent twice / some failed):
+// every due post used to fire in PARALLEL — each one a Telegram send + Firestore writes + a cache patch.
+// With lots of videos Telegram answered 429 (flood limit), some posts failed and the video/post pairs
+// went out of step. Now every due post goes through ONE queue: one at a time, ~1.3s apart, and
+// the post goes out POST_AFTER_VIDEO_MS after the video's publishAt, so the video is already visible
+// in the Mini App when people tap the channel post.
+const POST_AFTER_VIDEO_MS = 3000;
+const POST_FIRE_GAP_MS = 1300;
+const postFireQueue = [];
+const postFireQueued = new Set();
+let postFireRunning = false;
+function enqueuePostFire(docId, extraDelayMs) {
+  if (postFireQueued.has(docId)) return;           // already waiting — never fire the same post twice
+  postFireQueued.add(docId);
+  const delay = extraDelayMs === undefined ? POST_AFTER_VIDEO_MS : extraDelayMs;
+  setTimeout(() => { postFireQueue.push(docId); runPostFireQueue(); }, Math.max(0, delay));
+}
+async function runPostFireQueue() {
+  if (postFireRunning) return;
+  postFireRunning = true;
+  try {
+    while (postFireQueue.length) {
+      const id = postFireQueue.shift();
+      postFireQueued.delete(id);
+      try { await firePostSchedule(id); } catch (e) { console.error('❌ firePostSchedule error:', e.message); }
+      if (postFireQueue.length) await new Promise(r => setTimeout(r, POST_FIRE_GAP_MS));
+    }
+  } finally { postFireRunning = false; }
 }
 
 // On boot: pick up anything still pending (covers posts that were due while
@@ -7068,7 +7122,7 @@ function schedulePostTimer(docId, delayMs) {
     const now = Date.now();
     snap.docs.forEach(doc => {
       const scheduledAt = Number(doc.data().scheduledAt) || 0;
-      if (scheduledAt <= now) firePostSchedule(doc.id).catch(e => console.error('❌ firePostSchedule error:', e.message));
+      if (scheduledAt <= now) enqueuePostFire(doc.id, 0);
       else schedulePostTimer(doc.id, scheduledAt - now);
     });
   } catch (error) {
@@ -7097,7 +7151,7 @@ cron.schedule('*/30 * * * *', async () => {
       .get();
     for (const doc of dueSnap.docs) {
       if (!scheduledTimers.has(doc.id)) {
-        await firePostSchedule(doc.id);
+        enqueuePostFire(doc.id, 0);
       }
     }
 
@@ -7112,7 +7166,7 @@ cron.schedule('*/30 * * * *', async () => {
       .get();
     for (const doc of stuckSnap.docs) {
       await doc.ref.set({ status: 'pending' }, { merge: true });
-      firePostSchedule(doc.id).catch(e => console.error('❌ firePostSchedule retry error:', e.message));
+      enqueuePostFire(doc.id, 0);
     }
 
     // 👑 VIP subscription safety net — same 5-tick, piggybacked onto this
