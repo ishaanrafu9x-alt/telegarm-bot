@@ -1704,6 +1704,14 @@ async function getChannels() {
       seen.add(key);
       result.push(c);
     }
+    // Admin-chosen order (Channels > ↕️ Order). Channels that were never ordered keep the old createdAt order after the ordered ones.
+    result.sort((a, b) => {
+      const ha = Number.isFinite(a.sortOrder), hb = Number.isFinite(b.sortOrder);
+      if (ha && hb) return a.sortOrder - b.sortOrder;
+      if (ha) return -1;
+      if (hb) return 1;
+      return 0;
+    });
   } catch (e) {
     console.error('❌ Channel list read error:', e.message);
   }
@@ -1862,6 +1870,36 @@ bot.action('pch_continue', async ctx => {
     );
   }
 });
+
+// ↕️ Channel ordering: move one channel up / down / to the very top, then store a clean 10,20,30… order for all of them.
+async function moveChannel(id, dir) {
+  invalidateChannelsCache();
+  const list = (await getChannels()).filter(c => !c.legacy && !c.legacyOverride);
+  const i = list.findIndex(c => c.id === id);
+  if (i < 0) return false;
+  const j = dir === 'up' ? i - 1 : dir === 'down' ? i + 1 : 0;
+  if (j < 0 || j >= list.length || j === i) return false;
+  const [item] = list.splice(i, 1);
+  list.splice(j, 0, item);
+  const batch = db.batch();
+  list.forEach((c, idx) => batch.update(db.collection('channels').doc(c.id), { sortOrder: (idx + 1) * 10 }));
+  await batch.commit();
+  invalidateChannelsCache();
+  return true;
+}
+
+async function renderChannelOrder(ctx) {
+  const list = (await getChannels()).filter(c => !c.legacy && !c.legacyOverride);
+  const rows = list.map((c, i) => [
+    Markup.button.callback(`${i + 1}. ${safeTruncate(c.name || c.channelId, 20)}`, 'ach_order_noop'),
+    Markup.button.callback('⏫', `chmv:top:${c.id}`),
+    Markup.button.callback('⬆️', `chmv:up:${c.id}`),
+    Markup.button.callback('⬇️', `chmv:down:${c.id}`)
+  ]);
+  rows.push([Markup.button.callback('✅ Done', 'adm_channels')]);
+  const text = '↕️ CHANNEL ORDER\n\n⏫ একদম উপরে   ⬆️ এক ধাপ উপরে   ⬇️ এক ধাপ নিচে\n\nPost করার সময় Channel এই ক্রমেই দেখাবে।' + (list.length ? '' : '\n\n(কোনো Channel নেই)');
+  return ctx.editMessageText(text, Markup.inlineKeyboard(rows)).catch(() => {});
+}
 
 async function addChannelRecord(data) {
   // Re-adding a previously deleted channel un-deletes it.
@@ -3733,6 +3771,7 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   if (action === 'channels') {
     const channels = await getChannels();
     const rows = channels.map(ch => [Markup.button.callback(`${ch.active === false ? '🔴' : '🟢'} ${safeTruncate(ch.name||ch.channelId, 35)}`, `ach_view:${ch.id || ch.channelId}`)]);
+    if (channels.filter(c => !c.legacy && !c.legacyOverride).length > 1) rows.push([Markup.button.callback('↕️ Order (Up / Down)', 'ach_order')]);
     rows.push([Markup.button.callback('➕ Add Channel', 'ach_add')]);
     rows.push([Markup.button.callback('⬅️ Back', 'adm_home')]);
     return ctx.editMessageText('📢 CHANNEL MANAGER\n\nএকটি Channel নির্বাচন করুন:', Markup.inlineKeyboard(rows));
@@ -4435,6 +4474,19 @@ bot.action(/^repost_confirm:(\d+)$/, async ctx => {
 
 
 // Channel manager actions
+bot.action('ach_order', async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌');
+  try { await ctx.answerCbQuery(); } catch (e) {}
+  return renderChannelOrder(ctx);
+});
+bot.action('ach_order_noop', async ctx => { try { await ctx.answerCbQuery(); } catch (e) {} });
+bot.action(/^chmv:(top|up|down):(.+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌');
+  let moved = false;
+  try { moved = await moveChannel(ctx.match[2], ctx.match[1]); } catch (e) { console.error('❌ Channel order error:', e.message); }
+  try { await ctx.answerCbQuery(moved ? '✅' : 'এখানেই আছে'); } catch (e) {}
+  return renderChannelOrder(ctx);
+});
 bot.action('ach_add', async ctx=>{ if(!adminOnly(ctx))return ctx.answerCbQuery('❌'); await ctx.answerCbQuery(); postData[ctx.from.id]={step:'channel_name'}; return ctx.reply('📢 নতুন Channel-এর নাম লিখুন:'); });
 bot.action(/^ach_view:(.+)$/, async ctx=>{ if(!adminOnly(ctx))return ctx.answerCbQuery('❌'); const id=ctx.match[1]; await ctx.answerCbQuery(); const channels=await getChannels(); const c=channels.find(x=>x.id===id || x.channelId===id); if(!c)return ctx.reply('❌ Channel পাওয়া যায়নি।'); return ctx.reply(`📢 ${c.name||'Posting Channel'}\n🆔 ${c.channelId}\n🔗 ${c.link||'(none)'}\n🟢 Active: ${c.active!==false}` ,Markup.inlineKeyboard([[Markup.button.callback('📤 Post Here','apostch:'+id),Markup.button.callback(c.active===false?'🟢 Enable':'🔴 Disable','ach_toggle:'+id)],[Markup.button.callback('✏️ Rename / Edit','ach_edit:'+id),Markup.button.callback('🗑️ Delete','ach_del:'+id)],[Markup.button.callback('⬅️ Back','adm_channels')]])); });
 bot.action(/^ach_edit:(.+)$/, async ctx=>{ if(!adminOnly(ctx))return ctx.answerCbQuery('❌'); const id=ctx.match[1]; const channels=await getChannels(); const c=channels.find(x=>x.id===id || x.channelId===id); if(!c)return ctx.answerCbQuery('❌ নেই'); await ctx.answerCbQuery(); const docId=id.startsWith('env_') ? id : id; if(id.startsWith('env_')) { await db.collection('channels').doc(docId).set({name:c.name||'Posting Channel',channelId:c.channelId,link:c.link||'',active:c.active!==false,createdAt:Date.now(),updatedAt:Date.now(),legacyOverride:true},{merge:true}); invalidateChannelsCache(); } postData[ctx.from.id]={step:'channel_edit_name',channelDocId:docId,channel:c}; return ctx.reply(`✏️ Current Channel Name: ${c.name||''}\n\nনতুন Channel Name পাঠান:`); });
