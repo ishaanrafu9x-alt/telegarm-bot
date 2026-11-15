@@ -328,7 +328,6 @@ function creditsView() {
     [Markup.button.callback(`🎁 বোনাস কত ${a.creditIcon}? (এখন ${a.adBonusCredits})`, 'adm_cr_bonus_amt')],
     [Markup.button.callback(`🔒 Daily Bonus Limit (এখন ${a.adBonusDailyMax > 0 ? a.adBonusDailyMax : 'নেই'})`, 'adm_cr_bonus_max')],
     [Markup.button.callback('📈 আজকের Credit Report', 'adm_cr_report'), Markup.button.callback('📅 গতকালের Report', 'adm_cr_report_y')],
-    [Markup.button.callback('📊 মোট হিসাব: কত বিলানো / কত খরচ (সব সময়)', 'adm_cr_total')],
     [Markup.button.callback(`📊 Daily Ad Limit বদলান (এখন ${dailyLimitCache})`, 'adm_daily_limit')],
     [Markup.button.callback('🏷 নাম বদলান', 'adm_cr_name'), Markup.button.callback('😀 আইকন বদলান', 'adm_cr_icon')],
     [Markup.button.callback(`➕➖ কোনো User-কে ${a.creditIcon} দিন / কাটুন`, 'adm_cr_give')],
@@ -1497,7 +1496,6 @@ let repostData = {};
 let adminChannelData = {};
 let adminButtonData = {};
 let bulkSelect = { ids: new Set(), page: 0 };
-const swapAdsPending = {};
 const BULK_PAGE_SIZE = 15;
 let adminVideoData = {};
 let userSearchData = {};
@@ -3659,72 +3657,6 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
         return ctx.reply(t, { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('💎 Credits', 'adm_credits')]]).reply_markup });
       } catch (e) { return ctx.reply('❌ Report আনা যায়নি: ' + e.message); }
     }
-    if (action === 'cr_total') {
-      // 📊 সব সময়ের মোট হিসাব — কম Read-এর জন্য Firestore sum()/count() aggregation ব্যবহার (১০০০ index entry = ১ read)।
-      // Aggregation চলে না এমন পুরনো SDK হলে নিজে থেকে পুরনো স্ক্যান পদ্ধতিতে ফিরে যায়।
-      await ctx.answerCbQuery('⏳ হিসাব হচ্ছে…').catch(() => {});
-      try {
-        const ic = appSettings.creditIcon;
-        const num = (v) => Math.max(0, Math.floor(Number(v) || 0));
-        const users = db.collection('users');
-        const nameOf = (x) => x.firstName || x.first_name || x.username || '';
-        let bonus = 0, bought = 0, spent = 0, balance = 0, spenders = 0, holders = 0, bonusUsers = 0, mode = 'agg';
-        const topBonus = [], topBought = [], topSpend = [];
-        try {
-          const AF = admin.firestore.AggregateField;
-          const sums = (await users.aggregate({ bonus: AF.sum('creditsBonus'), bought: AF.sum('creditsEarned'), spent: AF.sum('creditsSpent'), balance: AF.sum('credits') }).get()).data();
-          bonus = num(sums.bonus); bought = num(sums.bought); spent = num(sums.spent); balance = num(sums.balance);
-          const cnt = async (field) => (await users.where(field, '>', 0).count().get()).data().count;
-          [spenders, holders, bonusUsers] = await Promise.all([cnt('creditsSpent'), cnt('credits'), cnt('creditsBonus')]);
-          const top = async (field, arr) => {
-            const sn = await users.orderBy(field, 'desc').limit(5).select(field, 'firstName', 'first_name', 'username').get();
-            sn.forEach(d => { const x = d.data(); const n = num(x[field]); if (n > 0) arr.push({ id: d.id, n, name: nameOf(x) }); });
-          };
-          await Promise.all([top('creditsBonus', topBonus), top('creditsEarned', topBought), top('creditsSpent', topSpend)]);
-        } catch (aggErr) {
-          console.error('cr_total aggregation failed, scanning instead:', aggErr.message);
-          mode = 'scan';
-          bonus = bought = spent = balance = spenders = holders = bonusUsers = 0;
-          topBonus.length = topBought.length = topSpend.length = 0;
-          let last = null;
-          for (;;) {
-            let q = users.orderBy(admin.firestore.FieldPath.documentId()).select('credits', 'creditsBonus', 'creditsEarned', 'creditsSpent', 'firstName', 'first_name', 'username').limit(3000);
-            if (last) q = q.startAfter(last);
-            const snap = await q.get();
-            if (snap.empty) break;
-            snap.forEach(d => {
-              const x = d.data(); const b = num(x.creditsBonus), e = num(x.creditsEarned), sp = num(x.creditsSpent), bal = num(x.credits);
-              bonus += b; bought += e; spent += sp; balance += bal;
-              if (b > 0) { bonusUsers++; topBonus.push({ id: d.id, n: b, name: nameOf(x) }); }
-              if (e > 0) topBought.push({ id: d.id, n: e, name: nameOf(x) });
-              if (sp > 0) { spenders++; topSpend.push({ id: d.id, n: sp, name: nameOf(x) }); }
-              if (bal > 0) holders++;
-            });
-            last = snap.docs[snap.docs.length - 1];
-            if (snap.size < 3000) break;
-          }
-          [topBonus, topBought, topSpend].forEach(arr => { arr.sort((x, y) => y.n - x.n); arr.splice(5); });
-        }
-        const distributed = bonus + bought;
-        const other = distributed - spent - balance; // Admin কেটে নেওয়া / অন্য কারণে কমা
-        const list = (arr) => arr.length ? arr.map((r, i) => `${i + 1}. ${r.name ? r.name + ' · ' : ''}${r.id} → ${r.n} ${ic}`).join('\n') : '(কেউ নেই)';
-        let t = `📊 ${ic} মোট হিসাব (সব সময়)\n\n` +
-          `🎁 মোট বিলানো/যোগ হয়েছে: ${distributed} ${ic}\n` +
-          `   • Ad Bonus (ফ্রি): ${bonus} ${ic} (${bonusUsers} জন)\n` +
-          `   • কেনা + Admin-দেওয়া: ${bought} ${ic}\n\n` +
-          `🛒 মোট খরচ হয়েছে (ভিডিও Unlock): ${spent} ${ic} (${spenders} জন)\n` +
-          `💼 এখন সবার হাতে বাকি: ${balance} ${ic} (${holders} জন)\n` +
-          (other !== 0 ? `✂️ Admin কাটা/অন্য কারণে কমেছে: ${other} ${ic}\n` : '') +
-          `📈 খরচের হার: ${distributed > 0 ? Math.round((spent / distributed) * 1000) / 10 : 0}% (মোট বিলানোর মধ্যে)\n\n` +
-          `🏆 শীর্ষ ৫ — Ad Bonus পেয়েছে:\n${list(topBonus)}\n\n` +
-          `💳 শীর্ষ ৫ — কেনা/Admin-দেওয়া:\n${list(topBought)}\n\n` +
-          `🛒 শীর্ষ ৫ — খরচ করেছে:\n${list(topSpend)}\n\n` +
-          `ℹ️ যোগফল = বিলানো − খরচ − বাকি Balance। ভগ্নাংশ জমা ধরা হয়নি।\n` +
-          (mode === 'agg' ? '⚡ কম Read-এ হিসাব হয়েছে (sum aggregation)।' : '⚠️ aggregation চলেনি, তাই সব User স্ক্যান করা হয়েছে (বেশি Read)। firebase-admin আপডেট করলে সস্তা হবে।');
-        if (t.length > 3900) t = t.slice(0, 3900) + '…';
-        return ctx.reply(t, { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🔄 আবার হিসাব করুন', 'adm_cr_total')], [Markup.button.callback('💎 Credits', 'adm_credits')]]).reply_markup });
-      } catch (e) { return ctx.reply('❌ মোট হিসাব আনা যায়নি: ' + e.message); }
-    }
     if (action === 'cr_bonus_amt') { updateAdsData[ctx.from.id] = { step: 'cfg_creditBonusAmt' }; return ctx.reply(`🎁 বোনাস হিসেবে কত ${appSettings.creditIcon} পাবে? (১ - ১০০০০ এর মধ্যে সংখ্যা)\nএখন: ${appSettings.adBonusCredits}`); }
     if (action === 'cr_perad') { updateAdsData[ctx.from.id] = { step: 'cfg_creditsPerAd' }; return ctx.reply(`✏️ ১টি Ad-এর বদলে কত ${appSettings.creditIcon} কাটবে? (১ - ১০০০০ এর মধ্যে সংখ্যা লিখুন)\nএখন: ${appSettings.creditsPerAd}`); }
     if (action === 'cr_name') { updateAdsData[ctx.from.id] = { step: 'cfg_creditName' }; return ctx.reply('🏷 Credit-এর নাম লিখুন (যেমন: Diamond, Coin, Gem — সর্বোচ্চ ১৪ অক্ষর):'); }
@@ -3772,7 +3704,6 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       [Markup.button.callback('🖼️ Thumbnail Edit', 'adm_video_thumb')],
       [Markup.button.callback('🗑️ Delete Video', 'adm_video_delete')],
       [Markup.button.callback('🗂️ Bulk Select (Delete/Ads)', 'adm_bulk_topics')],
-      [Markup.button.callback('🔁 Ads একসাথে বদলান (যেমন ২ Ads → ৩ Ads)', 'adm_ads_swap')],
       [Markup.button.callback('🙈 Hidden / Scheduled Videos', 'hv_list')],
       [Markup.button.callback('⏰ Publish Schedule', 'adm_vsched')],
       [Markup.button.callback('⬅️ Back', 'adm_home')]
@@ -4160,42 +4091,6 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
     return ctx.editMessageText(`✅ ${deleted}টি টপিক delete করা হয়েছে।`, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'adm_videos')]]));
   }
   if (action === 'bulk_delete_no') { return renderBulkTopicsPanel(ctx); }
-  if (action === 'ads_swap') {
-    // 🔁 Topic ID না দিয়ে: যে ভিডিওগুলোর Ads = N, সবগুলোকে একসাথে M করা (cache থেকে গোনা — Firestore read লাগে না)
-    delete swapAdsPending[ctx.from.id];
-    const topics = await getTopicsCached();
-    const groups = new Map();
-    topics.forEach(t => { const n = Math.max(1, Number(t.adsRequired) || 1); groups.set(n, (groups.get(n) || 0) + 1); });
-    if (!groups.size) return ctx.editMessageText('📭 এখনো কোনো টপিক নেই।', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'adm_videos')]]));
-    const keys = Array.from(groups.keys()).sort((a, b) => a - b).slice(0, 30);
-    const rows = keys.map(n => [Markup.button.callback(`${n} Ads → ${groups.get(n)}টি ভিডিও (বদলাতে চাপুন)`, 'adm_ads_from_' + n)]);
-    rows.push([Markup.button.callback('⬅️ Back', 'adm_videos')]);
-    return ctx.editMessageText('🔁 ADS একসাথে বদলান\n\nনিচে এখন কোন Ads সংখ্যায় কয়টা ভিডিও আছে দেখাচ্ছে। যেটার Ads বদলাতে চান সেটা চাপুন — ওই সংখ্যার সব ভিডিও একসাথে বদলে যাবে (Topic ID লাগবে না)।', Markup.inlineKeyboard(rows));
-  }
-  if (action.startsWith('ads_from_')) {
-    const from = parseInt(action.slice('ads_from_'.length), 10);
-    if (!Number.isInteger(from) || from < 1) return;
-    updateAdsData[ctx.from.id] = { step: 'swapAdsTo', from };
-    return ctx.reply(`🔁 এখন যেসব ভিডিওর Ads = ${from}, সেগুলোর নতুন Ads কত হবে? (১ - ৯৯৯ এর মধ্যে সংখ্যা লিখুন)`);
-  }
-  if (action === 'ads_swap_yes') {
-    const pend = swapAdsPending[ctx.from.id];
-    if (!pend) return ctx.reply('❌ কোনো পেন্ডিং পরিবর্তন নেই। আবার শুরু করুন।', Markup.inlineKeyboard([[Markup.button.callback('🔁 আবার শুরু', 'adm_ads_swap')]]));
-    delete swapAdsPending[ctx.from.id];
-    try {
-      await ctx.answerCbQuery('⏳ বদলানো হচ্ছে…').catch(() => {});
-      const topics = await getTopicsCached();
-      const ids = topics.filter(t => Math.max(1, Number(t.adsRequired) || 1) === pend.from).map(t => t.id);
-      const nowIso = new Date().toISOString();
-      for (let i = 0; i < ids.length; i += 400) {
-        const batch = db.batch();
-        ids.slice(i, i + 400).forEach(id => batch.update(db.collection('topics').doc(id), { adsRequired: pend.to, updatedAt: nowIso }));
-        await batch.commit();
-      }
-      invalidateTopicsCache();
-      return ctx.reply(`✅ ${ids.length}টি ভিডিওর Ads ${pend.from} থেকে ${pend.to} করা হয়েছে।\n(Mini App-এ ~১ মিনিটের মধ্যে কার্যকর হবে)`, { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🔁 আরেকটা বদলান', 'adm_ads_swap')], [Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup });
-    } catch (e) { return ctx.reply('❌ বদলানো যায়নি: ' + e.message); }
-  }
   if (action === 'bulk_ads_prompt') {
     if (!bulkSelect.ids.size) { return renderBulkTopicsPanel(ctx); }
     updateAdsData[ctx.from.id] = { step: 'bulkAdsCount', ids: Array.from(bulkSelect.ids) };
@@ -5724,19 +5619,6 @@ bot.on('text', async (ctx) => {
     return ctx.reply(`✅ CPM এখন ${value} ৳ (প্রতি ১০০০ ad view)।`);
   }
 
-  if (updateAdsData[userId] && updateAdsData[userId].step === 'swapAdsTo') {
-    const to = Number(text);
-    if (!Number.isInteger(to) || to < 1 || to > 999) return ctx.reply('❌ Ads count 1-999 এর মধ্যে একটা পূর্ণ সংখ্যা হতে হবে।');
-    const from = updateAdsData[userId].from;
-    delete updateAdsData[userId];
-    if (to === from) return ctx.reply('ℹ️ আগের আর নতুন সংখ্যা একই, কিছু বদলানোর নেই।');
-    const topics = await getTopicsCached();
-    const n = topics.filter(t => Math.max(1, Number(t.adsRequired) || 1) === from).length;
-    if (!n) return ctx.reply(`📭 এখন ${from} Ads-এর কোনো ভিডিও নেই।`, { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🔁 আবার দেখুন', 'adm_ads_swap')]]).reply_markup });
-    swapAdsPending[userId] = { from, to };
-    return ctx.reply(`⚠️ নিশ্চিত করুন:\n\nযে ${n}টি ভিডিওর Ads = ${from}, সবগুলোর Ads হবে ${to}।`, { reply_markup: Markup.inlineKeyboard([[Markup.button.callback(`✅ হ্যাঁ, ${n}টি বদলান (${from} → ${to})`, 'adm_ads_swap_yes')], [Markup.button.callback('❌ বাতিল', 'adm_ads_swap')]]).reply_markup });
-  }
-
   if (updateAdsData[userId] && updateAdsData[userId].step === 'bulkAdsCount') {
     const value = Number(text);
     if (!Number.isInteger(value) || value < 1 || value > 999) return ctx.reply('❌ Ads count 1-999 এর মধ্যে একটা সংখ্যা হতে হবে।');
@@ -6031,8 +5913,12 @@ bot.action(/^acc:(free|vip)$/, async ctx => {
   if (!isTopic && !isVideo) return ctx.answerCbQuery('⌛ সেশন শেষ, আবার শুরু করুন');
   await ctx.answerCbQuery();
   try { await ctx.editMessageText(premium ? '🔒 ঠিক আছে: শুধু VIP / Credit' : '🌍 ঠিক আছে: সবাই (Ads দেখে)'); } catch (e) {}
-  if (isTopic) { const d = addTopicData[uid]; d.premiumOnly = premium; await saveTopic(ctx, d); delete addTopicData[uid]; }
-  else { const d = addVideoData[uid]; d.premiumOnly = premium; await saveVideo(ctx, d); delete addVideoData[uid]; }
+  const d = isTopic ? addTopicData[uid] : addVideoData[uid];
+  d.premiumOnly = premium;
+  const pls = await getPlaylists();
+  if (!pls.length) return finishSave(ctx, uid, isTopic);
+  d.step = 'playlist'; d.playlistIds = [];
+  return ctx.reply('🎞️ কোন Playlist-এ রাখবেন? (একাধিক বাছা যায়, দরকার না হলে সরাসরি Save)', playlistKeyboard(pls, []));
 });
 bot.action(/^av_prem:(.+)$/, async ctx => {
   if (!adminOnly(ctx)) return ctx.answerCbQuery('❌');
@@ -6051,6 +5937,64 @@ bot.action(/^av_prem:(.+)$/, async ctx => {
 // 💾 SAVE HELPERS
 // =============================================
 
+// =============================================
+// 🎞️ PLAYLISTS (system/playlists.json — same doc the Worker admin panel edits)
+// =============================================
+async function getPlaylists() {
+  try {
+    const d = await db.collection('system').doc('playlists').get();
+    const a = JSON.parse((d.exists && d.data().json) || '[]');
+    return Array.isArray(a) ? a.filter(p => p && p.id && p.name) : [];
+  } catch (e) { console.error('getPlaylists failed:', e.message); return []; }
+}
+async function addTopicToPlaylists(topicId, ids) {
+  if (!ids || !ids.length) return;
+  const ref = db.collection('system').doc('playlists');
+  await db.runTransaction(async tx => {
+    const d = await tx.get(ref);
+    let a = []; try { a = JSON.parse((d.exists && d.data().json) || '[]'); } catch (_) {}
+    if (!Array.isArray(a)) a = [];
+    a.forEach(p => {
+      if (!ids.includes(p.id)) return;
+      p.topicIds = Array.isArray(p.topicIds) ? p.topicIds : [];
+      if (!p.topicIds.includes(topicId)) p.topicIds.unshift(topicId);
+    });
+    tx.set(ref, { json: JSON.stringify(a), updatedAt: Date.now() }, { merge: true });
+  });
+}
+function playlistKeyboard(pls, sel) {
+  const rows = pls.map(p => [Markup.button.callback((sel.includes(p.id) ? '✅ ' : '⬜ ') + String(p.name).slice(0, 40), 'pls:' + p.id)]);
+  rows.push([Markup.button.callback(sel.length ? '💾 Save করুন (' + sel.length + ' Playlist)' : '💾 Save করুন (Playlist ছাড়া)', 'pls_done')]);
+  return Markup.inlineKeyboard(rows);
+}
+async function finishSave(ctx, uid, isTopic) {
+  const d = isTopic ? addTopicData[uid] : addVideoData[uid];
+  if (isTopic) { await saveTopic(ctx, d); delete addTopicData[uid]; }
+  else { await saveVideo(ctx, d); delete addVideoData[uid]; }
+}
+bot.action(/^pls:(.+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌');
+  const uid = ctx.from.id, id = ctx.match[1];
+  const d = (addTopicData[uid] && addTopicData[uid].step === 'playlist') ? addTopicData[uid] : (addVideoData[uid] && addVideoData[uid].step === 'playlist') ? addVideoData[uid] : null;
+  if (!d) return ctx.answerCbQuery('⌛ সেশন শেষ, আবার শুরু করুন');
+  d.playlistIds = Array.isArray(d.playlistIds) ? d.playlistIds : [];
+  const k = d.playlistIds.indexOf(id);
+  if (k >= 0) d.playlistIds.splice(k, 1); else d.playlistIds.push(id);
+  await ctx.answerCbQuery();
+  try { await ctx.editMessageReplyMarkup(playlistKeyboard(await getPlaylists(), d.playlistIds).reply_markup); } catch (e) {}
+});
+bot.action('pls_done', async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌');
+  const uid = ctx.from.id;
+  const isTopic = !!(addTopicData[uid] && addTopicData[uid].step === 'playlist');
+  const isVideo = !!(addVideoData[uid] && addVideoData[uid].step === 'playlist');
+  if (!isTopic && !isVideo) return ctx.answerCbQuery('⌛ সেশন শেষ, আবার শুরু করুন');
+  await ctx.answerCbQuery();
+  const sel = (isTopic ? addTopicData[uid] : addVideoData[uid]).playlistIds || [];
+  try { await ctx.editMessageText(sel.length ? '🎞️ ঠিক আছে: ' + sel.length + 'টি Playlist-এ যাবে' : '🎞️ ঠিক আছে: কোনো Playlist-এ না'); } catch (e) {}
+  await finishSave(ctx, uid, isTopic);
+});
+
 async function saveTopic(ctx, data) {
   try {
     const topicRef = db.collection('topics').doc();
@@ -6068,6 +6012,7 @@ async function saveTopic(ctx, data) {
       sortOrder: Date.now(),
       createdAt: new Date().toISOString()
     });
+    try { await addTopicToPlaylists(topicRef.id, data.playlistIds); } catch (e) { console.error('playlist add failed:', e.message); }
     invalidateTopicsCache();
     await ctx.reply(`✅ টপিক <code>${escapeHtml(data.title)}</code> তৈরি হয়েছে!\n📹 ভিডিও সংখ্যা: ${data.videos.length}\n🔢 অ্যাড প্রয়োজন: ${data.adsRequired}\n🆔 টপিক আইডি: <code>${topicRef.id}</code>${heldNote()}\n\n📢 এখন Post করবেন কি? (Post Now বা Schedule — শুধু Thumbnail + Title যাবে, ভিডিও যাবে না)`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
       [Markup.button.callback('📢 Post করুন (Thumbnail + Title)', 'apost_thumb:' + topicRef.id)],
@@ -6096,6 +6041,7 @@ async function saveVideo(ctx, data) {
       sortOrder: Date.now(),
       createdAt: new Date().toISOString()
     });
+    try { await addTopicToPlaylists(topicRef.id, data.playlistIds); } catch (e) { console.error('playlist add failed:', e.message); }
     invalidateTopicsCache();
     await ctx.reply(`✅ ভিডিও <code>${escapeHtml(data.title)}</code> যোগ হয়েছে!\n🆔 টপিক আইডি: <code>${topicRef.id}</code>${heldNote()}\n\n📢 এখন Post করবেন কি? (Post Now বা Schedule — শুধু Thumbnail + Title যাবে, ভিডিও যাবে না)`, { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
       [Markup.button.callback('📢 Post করুন (Thumbnail + Title)', 'apost_thumb:' + topicRef.id)],
