@@ -3353,6 +3353,31 @@ bot.command('admin', async (ctx) => {
 // =============================================
 // 👑 BUTTON-BASED ADMIN PANEL
 // =============================================
+// 📊 ADS GROUP — কোন Ads সংখ্যায় কয়টা ভিডিও আছে দেখায়; বাটনে ট্যাপ করে নতুন সংখ্যা দিলে
+// ওই গ্রুপের সব ভিডিওর Ads Required একসাথে বদলে যায়।
+function adsGroupsOf(topics) {
+  const map = new Map();
+  for (const t of topics) {
+    if (t.premiumOnly === true) continue; // VIP/Credit-only ভিডিওতে Ads লাগে না
+    const n = Math.max(1, Number(t.adsRequired) || 1);
+    if (!map.has(n)) map.set(n, []);
+    map.get(n).push(t.id);
+  }
+  return map;
+}
+async function renderAdsGroupsPanel(ctx, note) {
+  const topics = await getTopicsCached();
+  const groups = adsGroupsOf(topics);
+  const keys = Array.from(groups.keys()).sort((a, b) => a - b);
+  const rows = keys.map(n => [Markup.button.callback(`🎯 ${n} Ads  →  📹 ${groups.get(n).length}টি ভিডিও`, `agrp:${n}`)]);
+  rows.push([Markup.button.callback('⬅️ Back', 'adm_ads')]);
+  const total = keys.reduce((a, n) => a + groups.get(n).length, 0);
+  const text = `📊 ADS GROUP\n\n${note ? note + '\n\n' : ''}যে বাটনে ট্যাপ করবেন, ওই গ্রুপের সব ভিডিওর Ads সংখ্যা নতুন সংখ্যায় বদলে যাবে।\n\nমোট ভিডিও (Ads-সহ): ${total}`;
+  const kb = Markup.inlineKeyboard(rows);
+  if (!keys.length) return ctx.reply('📭 কোনো ভিডিও নেই।', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'adm_ads')]]));
+  try { return await ctx.editMessageText(text, kb); } catch (e) { return ctx.reply(text, kb); }
+}
+
 async function renderBulkTopicsPanel(ctx) {
   const topics = await getTopicsCached();
   if (!topics.length) {
@@ -3557,6 +3582,17 @@ bot.action(/^vipu:(\d+)$/, async (ctx) => {
   } catch (e) { return ctx.reply('❌ ' + e.message); }
 });
 // ============ /VIP UNLOCK REPORT ============
+
+bot.action(/^agrp:(\d+)$/, async (ctx) => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('❌');
+  await ctx.answerCbQuery();
+  const from = Number(ctx.match[1]);
+  const groups = adsGroupsOf(await getTopicsCached());
+  const count = (groups.get(from) || []).length;
+  if (!count) return renderAdsGroupsPanel(ctx, '⚠️ এই গ্রুপে আর কোনো ভিডিও নেই।');
+  updateAdsData[ctx.from.id] = { step: 'groupAdsCount', from };
+  return ctx.reply(`🎯 বর্তমানে ${from} Ads-এর ভিডিও: ${count}টি\n\n🔢 এই ${count}টি ভিডিওর নতুন Ads সংখ্যা লিখুন (1-999):\n(বাতিল করতে /cancel)`);
+});
 
 bot.action(/^adm_(.+)$/, async (ctx) => {
   if (!adminOnly(ctx)) return ctx.answerCbQuery('❌ অনুমতি নেই');
@@ -3957,7 +3993,8 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
     }
     return;
   }
-  if (action === 'ads') return ctx.reply('📺 Ads Management', Markup.inlineKeyboard([[Markup.button.callback('📡 Ad Networks (ON/OFF)','adm_networks')],[Markup.button.callback('🎯 Set Video Ads','adm_set_ads')],[Markup.button.callback('🎯 Daily Limit','adm_daily_limit')],[Markup.button.callback('⬅️ Back','adm_home')]]));
+  if (action === 'ads') return ctx.reply('📺 Ads Management', Markup.inlineKeyboard([[Markup.button.callback('📡 Ad Networks (ON/OFF)','adm_networks')],[Markup.button.callback('🎯 Set Video Ads','adm_set_ads')],[Markup.button.callback('📊 Ads Group (সব একসাথে বদলান)','adm_ads_groups')],[Markup.button.callback('🎯 Daily Limit','adm_daily_limit')],[Markup.button.callback('⬅️ Back','adm_home')]]));
+  if (action === 'ads_groups') { return renderAdsGroupsPanel(ctx); }
   if (action === 'set_ads') { updateAdsData[ctx.from.id]={step:'topicId'}; return ctx.reply('🎯 Video/Topic ID পাঠান:'); }
   if (action === 'daily_limit') { const current=await getDailyAdLimit(); updateAdsData[ctx.from.id]={step:'dailyLimit'}; return ctx.reply(`📊 বর্তমান Daily Ad Limit: ${current}টি\n\nনতুন limit লিখুন:`); }
   if (action === 'uprofile') {
@@ -5617,6 +5654,28 @@ bot.on('text', async (ctx) => {
     adCpmCache = value; adCpmCacheAt = Date.now();
     delete updateAdsData[userId];
     return ctx.reply(`✅ CPM এখন ${value} ৳ (প্রতি ১০০০ ad view)।`);
+  }
+
+  if (updateAdsData[userId] && updateAdsData[userId].step === 'groupAdsCount') {
+    const value = Number(text);
+    if (!Number.isInteger(value) || value < 1 || value > 999) return ctx.reply('❌ Ads count 1-999 এর মধ্যে একটা পূর্ণ সংখ্যা হতে হবে।');
+    const from = updateAdsData[userId].from;
+    delete updateAdsData[userId];
+    try {
+      const ids = adsGroupsOf(await getTopicsCached()).get(from) || [];
+      if (!ids.length) return ctx.reply('⚠️ এই গ্রুপে এখন আর কোনো ভিডিও নেই।');
+      const nowIso = new Date().toISOString();
+      for (let i = 0; i < ids.length; i += 400) {
+        const batch = db.batch();
+        ids.slice(i, i + 400).forEach(id => batch.update(db.collection('topics').doc(id), { adsRequired: value, updatedAt: nowIso }));
+        await batch.commit();
+      }
+      invalidateTopicsCache();
+      return ctx.reply(`✅ ${from} Ads-এর ${ids.length}টি ভিডিও এখন ${value} Ads হয়ে গেছে।`, { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('📊 Ads Group', 'adm_ads_groups')], [Markup.button.callback('🏠 Admin Panel', 'adm_home')]]).reply_markup });
+    } catch (error) {
+      console.error('❌ Group ads update error:', error.message);
+      return ctx.reply('❌ আপডেট করতে সমস্যা হয়েছে: ' + error.message);
+    }
   }
 
   if (updateAdsData[userId] && updateAdsData[userId].step === 'bulkAdsCount') {
