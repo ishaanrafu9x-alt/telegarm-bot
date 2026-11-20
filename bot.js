@@ -1950,7 +1950,7 @@ async function sendAdminPanel(ctx, edit = false) {
     [Markup.button.callback('💰 Revenue', 'adm_revenue'), Markup.button.callback('📦 Export Data', 'adm_export')],
     [Markup.button.callback('🕒 Scheduled Posts', 'adm_scheduled'), Markup.button.callback('📈 Reports', 'adm_reports')],
     [Markup.button.callback('👑 VIP Subscription', 'adm_vip'), Markup.button.callback('⚙️ Settings', 'adm_cfg')],
-    [Markup.button.callback('💎 Credits', 'adm_credits')],
+    [Markup.button.callback('💎 Credits', 'adm_credits'), Markup.button.callback('🎨 Theme Switch', 'adm_theme')],
     [Markup.button.callback('⌨️ Keyboard Show', 'adm_kb_show'), Markup.button.callback('❌ Keyboard Hide', 'adm_kb_hide')]
   ]);
   const chatId = ctx.chat && ctx.chat.id;
@@ -1983,7 +1983,7 @@ const ADMIN_KB_BUTTONS = [
   ['📣 Broadcast', 'broadcast'], ['🔘 Post Buttons', 'buttons'],
   ['💰 Revenue', 'revenue'], ['📦 Export Data', 'export'],
   ['🕒 Scheduled Posts', 'scheduled'], ['👑 VIP Subscription', 'vip'], ['⚙️ Settings', 'cfg'], ['📈 Reports', 'reports'],
-  ['🏠 Admin Panel', 'home'], ['❌ Keyboard Hide', 'kb_hide']
+  ['🎨 Theme Switch', 'theme'], ['🏠 Admin Panel', 'home'], ['❌ Keyboard Hide', 'kb_hide']
 ];
 function adminReplyKeyboard() {
   const rows = [];
@@ -3623,6 +3623,24 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
   }
   try {
   if (action === 'home') return sendAdminPanel(ctx, true);
+  // 🎨 Theme switch (video app <-> quiz app). Stored in system/theme — the Cloudflare worker reads the same doc.
+  if (action === 'theme' || action === 'theme_video' || action === 'theme_quiz') {
+    try {
+      const ref = db.collection('system').doc('theme');
+      if (action !== 'theme') {
+        const mode = action === 'theme_quiz' ? 'quiz' : 'video';
+        await ref.set({ mode, updatedAt: Date.now() }, { merge: true });
+      }
+      const d = await ref.get();
+      const cur = d.exists && d.data() && d.data().mode === 'quiz' ? 'quiz' : 'video';
+      const txt = `🎨 THEME SWITCH\n\nএখন চালু: ${cur === 'quiz' ? '🧠 Quiz App (Video Ads বন্ধ)' : '🎬 Video App'}\n\nবদলালে সব ইউজারের Mini App ~১ মিনিটের মধ্যে (বা পরেরবার খুললেই) নতুন theme-এ চলে যাবে।`;
+      return ctx.reply(txt, Markup.inlineKeyboard([
+        [Markup.button.callback((cur === 'video' ? '✅ ' : '') + '🎬 Video App', 'adm_theme_video')],
+        [Markup.button.callback((cur === 'quiz' ? '✅ ' : '') + '🧠 Quiz App', 'adm_theme_quiz')],
+        [Markup.button.callback('⬅️ Back', 'adm_home')]
+      ]));
+    } catch (e) { return ctx.reply('❌ Theme বদলানো যায়নি: ' + e.message); }
+  }
   if (action === 'vip') {
     clearAdminWorkflow(ctx.from.id);
     return ctx.reply('👑 VIP SUBSCRIPTION', Markup.inlineKeyboard([
