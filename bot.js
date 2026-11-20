@@ -332,6 +332,7 @@ function creditsView() {
     [Markup.button.callback('🏷 নাম বদলান', 'adm_cr_name'), Markup.button.callback('😀 আইকন বদলান', 'adm_cr_icon')],
     [Markup.button.callback(`➕➖ কোনো User-কে ${a.creditIcon} দিন / কাটুন`, 'adm_cr_give')],
     [Markup.button.callback('🔎 User-এর Balance দেখুন', 'adm_cr_bal')],
+    [Markup.button.callback('📊 মোট Credit Report (দেওয়া / খরচ)', 'adm_cr_total')],
     [Markup.button.callback('🔄 আসল কেনাকাটা Sync (শেষ ১৪ দিন)', 'adm_cr_sync')],
     [Markup.button.callback('⬅️ Back', 'adm_home')]
   ]);
@@ -2265,11 +2266,12 @@ bot.start(async (ctx) => {
     }
     if (topicId) {
       try {
-        await deliverUnlockedTopic(userId, topicId);
+        const delivered = await deliverUnlockedTopic(userId, topicId);
         await updateUser(userId, {
           pendingUnlockTopicId: admin.firestore.FieldValue.delete(),
           pendingUnlockAt: admin.firestore.FieldValue.delete()
         });
+        if (delivered && delivered.silentlyBlocked) return;   // the block notice was already sent
         return ctx.reply('🎬 আপনার unlocked video পাঠানো হয়েছে।');
       } catch (deliveryError) {
         console.error('❌ Pending topic delivery error:', deliveryError.message);
@@ -3693,6 +3695,43 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
         return ctx.reply(t, { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('💎 Credits', 'adm_credits')]]).reply_markup });
       } catch (e) { return ctx.reply('❌ Report আনা যায়নি: ' + e.message); }
     }
+    if (action === 'cr_total') {
+      await ctx.answerCbQuery('⏳ হিসাব হচ্ছে…').catch(() => {});
+      try {
+        const ic = appSettings.creditIcon, nm = appSettings.creditName;
+        const map = new Map();
+        for (const f of ['creditsEarned', 'creditsBonus', 'creditsSpent']) {
+          const snap = await db.collection('users').where(f, '>', 0).select('credits', 'creditsEarned', 'creditsBonus', 'creditsSpent', 'firstName', 'username').get();
+          snap.forEach(d => { if (!map.has(d.id)) map.set(d.id, d.data() || {}); });
+        }
+        let earned = 0, bonus = 0, spent = 0, balance = 0, spenders = 0, holders = 0;
+        const rows = [];
+        map.forEach((x, id) => {
+          const e = Math.floor(Number(x.creditsEarned) || 0), b = Math.floor(Number(x.creditsBonus) || 0), sp = Math.floor(Number(x.creditsSpent) || 0), bal = Math.max(0, Math.floor(Number(x.credits) || 0));
+          earned += e; bonus += b; spent += sp; balance += bal;
+          if (sp > 0) spenders++; if (bal > 0) holders++;
+          rows.push({ id, sp, bal, name: x.firstName || x.username || '' });
+        });
+        const given = earned + bonus;
+        const other = given - spent - balance;
+        let t = `📊 মোট ${nm} Report (শুরু থেকে এখন পর্যন্ত)\n\n` +
+          `🎁 মোট দেওয়া হয়েছে: ${given} ${ic}\n` +
+          `   ├ কেনা / Admin-দেওয়া: ${earned} ${ic}\n` +
+          `   └ Ad দেখে বোনাস: ${bonus} ${ic}\n\n` +
+          `🔥 মোট খরচ হয়েছে: ${spent} ${ic} (${spenders} জন খরচ করেছে)\n` +
+          `💰 এখন Users-দের কাছে বাকি: ${balance} ${ic} (${holders} জনের কাছে)\n` +
+          (other !== 0 ? `➕➖ Admin কাটা/অন্যান্য সমন্বয়: ${other} ${ic}\n` : '') +
+          `\n🏆 সবচেয়ে বেশি খরচ (শীর্ষ ১০):\n`;
+        rows.filter(r => r.sp > 0).sort((a, b) => b.sp - a.sp).slice(0, 10).forEach((r, i) => { t += `${i + 1}. ${r.name ? r.name + ' · ' : ''}${r.id} → ${r.sp} ${ic}\n`; });
+        if (!spenders) t += '(এখনও কেউ খরচ করেনি)\n';
+        t += `\n💎 সবচেয়ে বেশি Balance (শীর্ষ ১০):\n`;
+        rows.filter(r => r.bal > 0).sort((a, b) => b.bal - a.bal).slice(0, 10).forEach((r, i) => { t += `${i + 1}. ${r.name ? r.name + ' · ' : ''}${r.id} → ${r.bal} ${ic}\n`; });
+        if (!holders) t += '(কারও কাছে Balance নেই)\n';
+        t += `\nℹ️ ভগ্নাংশ জমা থাকা বোনাস (পূর্ণ হয়নি) ধরা হয়নি। খরচের হিসাব যেদিন থেকে tracking চালু হয়েছে সেদিন থেকে।`;
+        if (t.length > 3900) t = t.slice(0, 3900) + '…';
+        return ctx.reply(t, { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('💎 Credits', 'adm_credits')]]).reply_markup });
+      } catch (e) { return ctx.reply('❌ Report আনা যায়নি: ' + e.message); }
+    }
     if (action === 'cr_bonus_amt') { updateAdsData[ctx.from.id] = { step: 'cfg_creditBonusAmt' }; return ctx.reply(`🎁 বোনাস হিসেবে কত ${appSettings.creditIcon} পাবে? (১ - ১০০০০ এর মধ্যে সংখ্যা)\nএখন: ${appSettings.adBonusCredits}`); }
     if (action === 'cr_perad') { updateAdsData[ctx.from.id] = { step: 'cfg_creditsPerAd' }; return ctx.reply(`✏️ ১টি Ad-এর বদলে কত ${appSettings.creditIcon} কাটবে? (১ - ১০০০০ এর মধ্যে সংখ্যা লিখুন)\nএখন: ${appSettings.creditsPerAd}`); }
     if (action === 'cr_name') { updateAdsData[ctx.from.id] = { step: 'cfg_creditName' }; return ctx.reply('🏷 Credit-এর নাম লিখুন (যেমন: Diamond, Coin, Gem — সর্বোচ্চ ১৪ অক্ষর):'); }
@@ -3716,8 +3755,8 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
           if (have.has(oid)) return;
           let nm = o.payerName || o.firstName || '';
           nm = nm ? Array.from(String(nm).trim())[0] + '***' : 'User';
-          const e = o.kind === 'credits' ? { c: Math.floor(Number(o.credits) || 0) } : { v: Number(o.totalDays) || 0 };
-          if (!e.c && !e.v) return;
+          const e = o.kind === 'credits' ? { c: Math.floor(Number(o.credits) || 0) } : o.kind === 'minutes' ? { m: Math.floor(Number(o.minutes) || 0) } : { v: Number(o.totalDays) || 0 };
+          if (!e.c && !e.v && !e.m) return;
           list.push({ n: nm, p: Number(o.price) || 0, at: Number(o.approvedAt) || Date.now(), o: oid, ...e });
           added++;
         });
@@ -4236,7 +4275,7 @@ bot.action(/^vipdays:(\d+|custom)$/, async ctx => {
   await ctx.answerCbQuery();
   if (choice === 'custom') {
     vipSubData[ctx.from.id] = { step: 'customDays', targetId: state.targetId, mode: state.mode };
-    return ctx.reply('✏️ কতদিন? সংখ্যা লিখে পাঠান (যেমন: 45):');
+    return ctx.reply('✏️ কতদিন? সংখ্যা লিখে পাঠান (যেমন: 45)।\n⏱ মিনিট দিতে চাইলে সংখ্যার পরে m লিখুন (যেমন: 30m):');
   }
   const days = Number(choice);
   const targetId = state.targetId;
@@ -5283,11 +5322,13 @@ bot.on('text', async (ctx) => {
     );
   }
   if (vipSubData[userId] && vipSubData[userId].step === 'customDays') {
-    const days = Number.parseInt(text, 10);
-    if (!Number.isInteger(days) || days < 1) return ctx.reply('❌ ১ বা তার বেশি একটি সংখ্যা দিন (VIP বাদ দিতে চাইলে VIP মেনু থেকে "🗑️ VIP বাদ দিন" ব্যবহার করুন):');
+    const mm = text.trim().match(/^(\d+)\s*(m|min|mins|minute|minutes|মিনিট)?$/i);
+    const days = mm ? Number.parseInt(mm[1], 10) : NaN;
+    const unit = mm && mm[2] ? 'min' : undefined;
+    if (!Number.isInteger(days) || days < 1) return ctx.reply('❌ ১ বা তার বেশি একটি সংখ্যা দিন (দিন: 45, মিনিট: 30m)। VIP বাদ দিতে চাইলে VIP মেনু থেকে "🗑️ VIP বাদ দিন" ব্যবহার করুন:');
     const { targetId, mode } = vipSubData[userId];
     delete vipSubData[userId];
-    return mode === 'set' ? setVipSubscription(ctx, targetId, days) : grantVipSubscription(ctx, targetId, days);
+    return mode === 'set' ? setVipSubscription(ctx, targetId, days, unit) : grantVipSubscription(ctx, targetId, days, unit);
   }
 
   // Add Video/Topic text steps have priority over every other admin state.
@@ -6411,6 +6452,18 @@ async function notifyAdminBlockedUnlock(userId, topicId, userData) {
   );
 }
 
+// 🚫 Message shown (English + Bangla) to a blocked user when they try to get a video.
+function blockedNoticeText(data) {
+  const spam = data && data.blockedReason === 'support_spam';
+  return '🚫 You have been blocked\n\n' +
+    'Sorry, your account has been blocked, so videos can no longer be delivered to you.' +
+    (spam ? '\nReason: too many messages sent to support.' : '') +
+    '\n\n━━━━━━━━━━━━━━━\n\n' +
+    '🚫 আপনাকে ব্লক করে দেওয়া হয়েছে\n\n' +
+    'দুঃখিত, আপনার অ্যাকাউন্টটি ব্লক করা হয়েছে, তাই আপনাকে আর ভিডিও পাঠানো হবে না।' +
+    (spam ? '\nকারণ: সাপোর্টে অতিরিক্ত মেসেজ পাঠানো।' : '');
+}
+
 async function deliverUnlockedTopic(userId, topicId, userStateHint) {
   inflightDeliveries++;
   try {
@@ -6446,6 +6499,7 @@ async function deliverUnlockedTopicInner(userId, topicId, userStateHint) {
   // matter which route triggered this call.
   if (data.blocked === true) {
     notifyAdminBlockedUnlock(String(userId), String(topicId), data).catch(() => {});
+    try { await bot.telegram.sendMessage(userId, blockedNoticeText(data)); } catch (e) { /* user may not have started the bot */ }
     return { success: true, videosDelivered: 0, silentlyBlocked: true };
   }
 
@@ -6977,24 +7031,26 @@ function armVipTimer(userId, expiresAt) {
 // human admin action (not a per-user hot path), so the one extra Firestore
 // read here is a non-issue for the request-volume optimizations that matter
 // for real traffic.
-async function grantVipSubscription(ctx, userId, days) {
+async function grantVipSubscription(ctx, userId, days, unit) {
+  const isMin = unit === 'min';
+  const unitLabel = isMin ? `${days} মিনিট` : `${days} দিন`;
   try {
     const userRef = db.collection('users').doc(String(userId));
     const now = Date.now();
-    const addMs = days * 24 * 60 * 60 * 1000;
+    const addMs = isMin ? days * 60 * 1000 : days * 24 * 60 * 60 * 1000;
     const newExpiry = await db.runTransaction(async tx => {
       const snap = await tx.get(userRef);
       const current = snap.exists ? Number(snap.data().subscriptionExpiresAt) || 0 : 0;
       const base = current > now ? current : now;
       const result = base + addMs;
-      tx.set(userRef, { subscriptionExpiresAt: result }, { merge: true });
+      tx.set(userRef, { subscriptionExpiresAt: result, vipShort: isMin && (result - now) <= 24 * 60 * 60 * 1000 }, { merge: true });
       return result;
     });
     armVipTimer(userId, newExpiry);
     const payNote = await notifyVipViaPaymentBot(userId, newExpiry);
     const dateStr = new Date(newExpiry).toLocaleString('bn-BD', { timeZone: 'Asia/Dhaka', dateStyle: 'medium', timeStyle: 'short' });
     return ctx.reply(
-      `✅ VIP Subscription active করা হয়েছে!\n\n👤 User ID: <code>${userId}</code>\n➕ যোগ হয়েছে: ${days} দিন\n⏰ মেয়াদ শেষ হবে: ${dateStr}\n\nএই সময়ে এই user কোনো Ad ছাড়াই ভিডিও unlock করতে পারবে।\n\n${payNote}`,
+      `✅ VIP Subscription active করা হয়েছে!\n\n👤 User ID: <code>${userId}</code>\n➕ যোগ হয়েছে: ${unitLabel}\n⏰ মেয়াদ শেষ হবে: ${dateStr}\n\nএই সময়ে এই user কোনো Ad ছাড়াই ভিডিও unlock করতে পারবে।\n\n${payNote}`,
       { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]) }
     );
   } catch (error) {
@@ -7007,16 +7063,18 @@ async function grantVipSubscription(ctx, userId, days) {
 // overriding whatever was there before — unlike grantVipSubscription this
 // can also be used to shorten an existing subscription (e.g. 30 days left,
 // admin sets it to 5).
-async function setVipSubscription(ctx, userId, days) {
+async function setVipSubscription(ctx, userId, days, unit) {
+  const isMin = unit === 'min';
+  const unitLabel = isMin ? `${days} মিনিট` : `${days} দিন`;
   try {
     const userRef = db.collection('users').doc(String(userId));
-    const newExpiry = Date.now() + days * 24 * 60 * 60 * 1000;
-    await userRef.set({ subscriptionExpiresAt: newExpiry }, { merge: true });
+    const newExpiry = Date.now() + (isMin ? days * 60 * 1000 : days * 24 * 60 * 60 * 1000);
+    await userRef.set({ subscriptionExpiresAt: newExpiry, vipShort: isMin && days <= 1440 }, { merge: true });
     armVipTimer(userId, newExpiry);
     const payNote = await notifyVipViaPaymentBot(userId, newExpiry);
     const dateStr = new Date(newExpiry).toLocaleString('bn-BD', { timeZone: 'Asia/Dhaka', dateStyle: 'medium', timeStyle: 'short' });
     return ctx.reply(
-      `✅ VIP মেয়াদ বসানো হয়েছে!\n\n👤 User ID: <code>${userId}</code>\n📅 এখন থেকে: ${days} দিন\n⏰ মেয়াদ শেষ হবে: ${dateStr}\n\n${payNote}`,
+      `✅ VIP মেয়াদ বসানো হয়েছে!\n\n👤 User ID: <code>${userId}</code>\n📅 এখন থেকে: ${unitLabel}\n⏰ মেয়াদ শেষ হবে: ${dateStr}\n\n${payNote}`,
       { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🏠 Admin Panel', 'adm_home')]]) }
     );
   } catch (error) {
