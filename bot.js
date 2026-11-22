@@ -7178,8 +7178,12 @@ async function expireVipSubscription(userId) {
     const expiresAt = Number(snap.data().subscriptionExpiresAt) || 0;
     if (!expiresAt) return; // already cleared by an earlier run
     if (expiresAt > Date.now()) { armVipTimer(key, expiresAt); return; }
+    // 🎁 Free-trial VIP (claimed from the Payment bot): its expiry must NOT ping the admin.
+    // vipTrialExpiresAt matches only while the expiry is still the untouched trial one —
+    // if the user bought/was given more time later, the expiry differs and admin is notified as before.
+    const isFreeTrialExpiry = Number(snap.data().vipTrialExpiresAt) === expiresAt;
     await userRef.set({ subscriptionExpiresAt: admin.firestore.FieldValue.delete() }, { merge: true });
-    if (ADMIN_ID) {
+    if (ADMIN_ID && !isFreeTrialExpiry) {
       await safeSendMessage(
         ADMIN_ID,
         `⏰ VIP Subscription শেষ হয়ে গেছে\n\n👤 User ID: <code>${key}</code>\n\nএখন থেকে এই user আবার স্বাভাবিকভাবে Ad দেখে unlock করবে।`,
