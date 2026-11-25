@@ -496,10 +496,10 @@ async function shouldLinkVideoDefault(topicId) {
 }
 function schedRepeatKeyboard(state) {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('একবারই (No Repeat)', 'sched_repeat:none')],
-    [Markup.button.callback('🔁 প্রতিদিন (Daily)', 'sched_repeat:daily')],
-    [Markup.button.callback('🔁 প্রতি সপ্তাহে (Weekly)', 'sched_repeat:weekly')],
-    [Markup.button.callback(`📺 Video-ও এই সময়ে প্রকাশ: ${state.linkVideo ? '✅ হ্যাঁ' : '❌ না'}`, 'sched_link')]
+    [Markup.button.callback(`📺 Video-ও এই সময়ে প্রকাশ: ${state.linkVideo ? '✅ হ্যাঁ' : '❌ না'}  (বদলাতে চাপুন)`, 'sched_link')],
+    [Markup.button.callback('✅ Schedule সেভ করুন — একবারই', 'sched_repeat:none')],
+    [Markup.button.callback('🔁 সেভ করুন — প্রতিদিন (Daily)', 'sched_repeat:daily')],
+    [Markup.button.callback('🔁 সেভ করুন — প্রতি সপ্তাহে (Weekly)', 'sched_repeat:weekly')]
   ]);
 }
 // Make a hidden/scheduled topic visible right now (used by "Post Now" and when a linked schedule is cancelled).
@@ -3035,9 +3035,9 @@ bot.action(/^rsave:([a-f0-9]+)$/, async (ctx) => {
 bot.action('sched_link', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
   const state = postData[ctx.from.id];
-  if (!state || state.step !== 'schedule_repeat') return ctx.answerCbQuery('❌ Schedule data পাওয়া যায়নি। /post দিয়ে আবার শুরু করুন');
+  if (!state || state.step !== 'schedule_repeat') { await ctx.answerCbQuery('❌ Schedule সেভ হয়নি').catch(() => {}); return ctx.reply('❌ Schedule data পাওয়া যায়নি (bot restart হয়ে থাকতে পারে) — এই Post Schedule হয়নি। /post দিয়ে আবার শুরু করুন।'); }
   state.linkVideo = !state.linkVideo;
-  try { await ctx.answerCbQuery(state.linkVideo ? 'Video-ও এই সময়ে প্রকাশ হবে' : 'Video এখনকার মতোই থাকবে'); } catch (e) {}
+  try { await ctx.answerCbQuery((state.linkVideo ? 'Video-ও এই সময়ে প্রকাশ হবে' : 'Video এখনকার মতোই থাকবে') + ' — ⚠️ এখনো সেভ হয়নি, নিচের "সেভ করুন" বাটন চাপুন', { show_alert: true }); } catch (e) {}
   return ctx.editMessageReplyMarkup(schedRepeatKeyboard(state).reply_markup).catch(() => {});
 });
 
@@ -3046,7 +3046,8 @@ bot.action(/^sched_repeat:(none|daily|weekly)$/, async (ctx) => {
   const userId = ctx.from.id;
   const state = postData[userId];
   if (!state || state.step !== 'schedule_repeat' || !state.scheduleTime) {
-    return ctx.answerCbQuery('❌ Schedule data পাওয়া যায়নি। /post দিয়ে আবার শুরু করুন');
+    await ctx.answerCbQuery('❌ Schedule সেভ হয়নি').catch(() => {});
+    return ctx.reply('❌ Schedule data পাওয়া যায়নি (bot restart হয়ে থাকতে পারে) — এই Post Schedule হয়নি। /post দিয়ে আবার শুরু করুন।');
   }
   const recurrence = ctx.match[1] === 'none' ? null : ctx.match[1];
   const parsed = state.scheduleTime;
@@ -5480,8 +5481,14 @@ bot.on('text', async (ctx) => {
       state.scheduleTime = parsed;
       state.step = 'schedule_repeat';
       try { state.linkVideo = await shouldLinkVideoDefault(state.topicId); } catch (e) { state.linkVideo = false; }
+      if (state.saveReminder) clearTimeout(state.saveReminder);
+      state.saveReminder = setTimeout(() => {
+        if (postData[userId] === state && state.step === 'schedule_repeat' && ADMIN_ID) {
+          safeSendMessage(ADMIN_ID, `⚠️ এই Post এখনো Schedule হয়নি!\n\n📌 ${escapeHtml(state.title || '')}\n🆔 <code>${escapeHtml(String(state.topicId || ''))}</code>\n📅 ${formatDhakaDateTime(state.scheduleTime)}\n\nউপরের মেসেজের "✅ Schedule সেভ করুন" বাটন চাপলে তবেই Schedule হবে।`, { parse_mode: 'HTML' }).catch(() => {});
+        }
+      }, 90 * 1000);
       return ctx.reply(
-        `📅 সময়: ${formatDhakaDateTime(parsed)}\n\n📺 "Video-ও এই সময়ে প্রকাশ: হ্যাঁ" থাকলে video Mini App-এ ঠিক এই সময়েই আসবে (তার আগে লুকানো থাকবে)। যে video আগেই চালু (আগে কেউ unlock করেছে), সেটা আবার post করলে "না" থাকে।\n\n🔁 এটা কি বারবার (repeat) post হবে, নাকি একবারই?`,
+        `📅 সময়: ${formatDhakaDateTime(parsed)}\n\n📺 "Video-ও এই সময়ে প্রকাশ: হ্যাঁ" থাকলে video Mini App-এ ঠিক এই সময়েই আসবে (তার আগে লুকানো থাকবে)। যে video আগেই চালু (আগে কেউ unlock করেছে), সেটা আবার post করলে "না" থাকে।\n\n🔁 এটা কি বারবার (repeat) post হবে, নাকি একবারই?\n\n⚠️ নিচে "সেভ করুন" বাটন না চাপলে Schedule হবে না!`,
         schedRepeatKeyboard(state)
       );
     }
@@ -7223,6 +7230,7 @@ async function expireVipSubscription(userId) {
 })();
 const MAX_TIMEOUT_MS = 20 * 24 * 60 * 60 * 1000; // Node setTimeout overflows past ~24.8 days
 
+const claimErrCount = new Map();
 async function firePostSchedule(docId) {
   scheduledTimers.delete(docId);
   const ref = db.collection('scheduledPosts').doc(docId);
@@ -7245,9 +7253,18 @@ async function firePostSchedule(docId) {
       return data;
     });
   } catch (e) {
+    // ❗ used to be a silent return: the timer was already consumed, so the post was simply never sent
+    // (e.g. Firestore quota/network hiccup). Now it is retried every minute and the admin is told.
     console.error('❌ firePostSchedule claim error:', e.message);
+    const n = (claimErrCount.get(docId) || 0) + 1;
+    claimErrCount.set(docId, n);
+    if (n <= 10) schedulePostTimer(docId, 60 * 1000);
+    if (n === 1 && ADMIN_ID) {
+      await safeSendMessage(ADMIN_ID, `⚠️ Scheduled Post শুরু করা যায়নি (Database সমস্যা) — প্রতি ১ মিনিটে আবার চেষ্টা হবে।\n\n🆔 Topic: <code>${escapeHtml(String(docId))}</code>\n${escapeHtml(String(e.message).slice(0, 300))}`, { parse_mode: 'HTML' }).catch(() => {});
+    }
     return;
   }
+  claimErrCount.delete(docId);
   if (!sp) return; // already claimed by another call, cancelled, or already sent
 
   const now = Date.now();
@@ -7258,29 +7275,16 @@ async function firePostSchedule(docId) {
   // Scheduled list, nothing in the channel). Now it retries up to 3 more times (1 min apart) and tells the admin why.
   const attempts = Number(sp.attempts) || 0;
   const retryLater = async (why) => {
-    if (attempts >= 3) return false;
+    if (attempts >= 5) return false;
     await ref.set({ status: 'pending', attempts: attempts + 1, lastError: String(why).slice(0, 400) }, { merge: true });
     schedulePostTimer(docId, 60 * 1000);
-    if (ADMIN_ID) await safeSendMessage(ADMIN_ID, `⚠️ Scheduled Post যায়নি (চেষ্টা ${attempts + 1}/4) — ১ মিনিট পর আবার চেষ্টা হবে।\n\n${escapeHtml(String(why).slice(0, 600))}`, { parse_mode: 'HTML' }).catch(() => {});
+    if (ADMIN_ID) await safeSendMessage(ADMIN_ID, `⚠️ Scheduled Post যায়নি (চেষ্টা ${attempts + 1}/6) — ১ মিনিট পর আবার চেষ্টা হবে।\n\n${escapeHtml(String(why).slice(0, 600))}`, { parse_mode: 'HTML' }).catch(() => {});
     return true;
   };
   try {
-    const keyboard = await buildConfiguredPostKeyboard(sp.topicId);
-    for (const channelId of channels) {
-      try {
-        let sent;
-        if (sp.type === 'video') {
-          sent = await bot.telegram.sendVideo(channelId, sp.fileId, { ...captionExtra(sp.caption, sp.captionEntities), reply_markup: keyboard.reply_markup });
-        } else {
-          sent = await bot.telegram.sendPhoto(channelId, sp.fileId, { ...captionExtra(sp.caption, sp.captionEntities), reply_markup: keyboard.reply_markup });
-        }
-        saveEntries.push({ channelId, messageId: sent.message_id, type: sp.type, caption: sp.caption || '', title: sp.title || '', topicId: sp.topicId });
-        lines.push(`✅ ${channelId} — Message ID: ${sent.message_id}`);
-      } catch (chErr) {
-        console.error(`❌ Scheduled post error [${channelId}]:`, chErr.message);
-        lines.push(`❌ ${channelId} — ${chErr.message}`);
-      }
-    }
+    const sendRes = await sendScheduledPostToChannels(sp, channels);
+    sendRes.lines.forEach(l => lines.push(l));
+    sendRes.saveEntries.forEach(e => saveEntries.push(e));
     if (!saveEntries.length && channels.length) { if (await retryLater(lines.join('\n'))) return; }
     await ref.set({ status: (saveEntries.length || !channels.length) ? 'sent' : 'failed', sentAt: now, result: lines }, { merge: true });
     if (saveEntries.length) await releaseTopicAfterScheduledPost(sp.topicId, Number(sp.scheduledAt)).catch(e => console.error('release after scheduled post:', e.message));
@@ -7303,13 +7307,172 @@ async function firePostSchedule(docId) {
     schedulePostTimer(docId, nextAt - now);
   }
 
+  if (postWatchdogs.has(docId)) postFinished.add(docId);
   if (ADMIN_ID) {
-    await safeSendMessage(
-      ADMIN_ID,
-      `🕒 Scheduled Post সম্পন্ন হয়েছে\n\n📌 Title: ${escapeHtml(sp.title || 'নামবিহীন ভিডিও')}\n🆔 Video/Topic ID: <code>${escapeHtml(sp.topicId)}</code>\n\n${escapeHtml(lines.join('\n'))}`,
-      { parse_mode: 'HTML', reply_markup: postDoneMarkup(saveEntries) }
-    ).catch(() => {});
+    const postFailed = !saveEntries.length && channels.length > 0;
+    if (postFailed) {
+      // ❗ Auto post did not happen: send the thumbnail + Topic ID + reason, with a "Post Now" button.
+      await notifyScheduledPostFailed(docId, sp, lines.join('\n')).catch(e => console.error('notify failed-post error:', e.message));
+    } else {
+      const lateMin = Math.round((now - (Number(sp.scheduledAt) || now)) / 60000);
+      const lateNote = lateMin >= 5 ? `\n⏰ ${lateMin} মিনিট দেরিতে গেছে (server restart/ঘুম থেকে ওঠার কারণে হতে পারে)` : '';
+      await withTelegramRetry(() => safeSendMessage(
+        ADMIN_ID,
+        `🕒 Scheduled Post সম্পন্ন হয়েছে\n\n📌 Title: ${escapeHtml(sp.title || 'নামবিহীন ভিডিও')}\n🆔 Video/Topic ID: <code>${escapeHtml(sp.topicId)}</code>\n\n${escapeHtml(lines.join('\n'))}${lateNote}`,
+        { parse_mode: 'HTML', reply_markup: postDoneMarkup(saveEntries) }
+      )).catch(() => {});
+    }
   }
+}
+
+// Telegram flood-limit (429) handler: waits for the time Telegram asks for, then tries again.
+async function withTelegramRetry(fn, tries = 5) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); }
+    catch (err) {
+      lastErr = err;
+      const resp = err && err.response ? err.response : {};
+      const retryAfter = Number((resp.parameters && resp.parameters.retry_after) || (err && err.parameters && err.parameters.retry_after) || 0);
+      const is429 = resp.error_code === 429 || /\b429\b|Too Many Requests/i.test(String(err && err.message));
+      if (!is429 || i === tries - 1) throw err;
+      const waitMs = Math.min((retryAfter > 0 ? retryAfter : 5) + 1, 90) * 1000;
+      console.warn(`⏳ Telegram 429 — ${Math.round(waitMs / 1000)}s অপেক্ষা করে আবার চেষ্টা (${i + 1}/${tries - 1})`);
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+  }
+  throw lastErr;
+}
+
+// Sends one scheduled post to every channel. Returns { lines, saveEntries } (used by the timer AND by the manual "Post Now" button).
+async function sendScheduledPostToChannels(sp, channels) {
+  const lines = [];
+  const saveEntries = [];
+  const keyboard = await buildConfiguredPostKeyboard(sp.topicId);
+  for (const channelId of channels) {
+    try {
+      let sent;
+      if (sp.type === 'video') {
+        sent = await withTelegramRetry(() => bot.telegram.sendVideo(channelId, sp.fileId, { ...captionExtra(sp.caption, sp.captionEntities), reply_markup: keyboard.reply_markup }));
+      } else {
+        sent = await withTelegramRetry(() => bot.telegram.sendPhoto(channelId, sp.fileId, { ...captionExtra(sp.caption, sp.captionEntities), reply_markup: keyboard.reply_markup }));
+      }
+      saveEntries.push({ channelId, messageId: sent.message_id, type: sp.type, caption: sp.caption || '', title: sp.title || '', topicId: sp.topicId });
+      lines.push(`✅ ${channelId} — Message ID: ${sent.message_id}`);
+    } catch (chErr) {
+      console.error(`❌ Scheduled post error [${channelId}]:`, chErr.message);
+      lines.push(`❌ ${channelId} — ${chErr.message}`);
+    }
+  }
+  return { lines, saveEntries };
+}
+
+// ⚠️ Admin alert when a scheduled post could NOT be posted: thumbnail image + Title + Topic ID + reason + "Post Now" button.
+async function notifyScheduledPostFailed(docId, sp, reason) {
+  if (!ADMIN_ID) return;
+  let caption =
+    `⚠️ Scheduled Post করা যায়নি!\n\n` +
+    `📌 Title: <code>${escapeHtml(sp.title || 'নামবিহীন ভিডিও')}</code>\n` +
+    `🆔 Topic ID: <code>${escapeHtml(String(sp.topicId || ''))}</code>\n` +
+    `📅 নির্ধারিত সময়: ${formatDhakaDateTime(Number(sp.scheduledAt) || Date.now())}\n\n` +
+    `❌ কারণ:\n${escapeHtml(String(reason || 'অজানা').slice(0, 350))}\n\n` +
+    `👇 নিচের বাটনে চাপলে এখনই Post হয়ে যাবে।`;
+  if (caption.length > 1000) caption = caption.slice(0, 990) + '…';
+  const markup = Markup.inlineKeyboard([
+    [Markup.button.callback('🚀 এখন Post করুন', 'schednow:' + docId)],
+    [Markup.button.callback('🏠 Admin Panel', 'adm_home')]
+  ]).reply_markup;
+  let img = sp.type === 'photo' ? sp.fileId : null;
+  try {
+    if (!img && sp.topicId) {
+      const td = await db.collection('topics').doc(String(sp.topicId)).get();
+      if (td.exists && td.data().thumbnail) img = td.data().thumbnail;
+    }
+  } catch (e) {}
+  if (img) {
+    try { await withTelegramRetry(() => bot.telegram.sendPhoto(ADMIN_ID, img, { caption, parse_mode: 'HTML', reply_markup: markup })); return; }
+    catch (e) { console.error('failed-post photo send error:', e.message); }
+  }
+  await withTelegramRetry(() => safeSendMessage(ADMIN_ID, caption, { parse_mode: 'HTML', reply_markup: markup })).catch(() => {});
+}
+
+// 🚀 "এখন Post করুন" button on the failure alert.
+const manualPostBusy = new Set();
+bot.action(/^schednow:(.+)$/, async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('❌ অনুমতি নেই');
+  const id = ctx.match[1];
+  if (manualPostBusy.has(id)) return ctx.answerCbQuery('⏳ Post হচ্ছে, একটু অপেক্ষা করুন');
+  manualPostBusy.add(id);
+  try {
+    try { await ctx.answerCbQuery('Posting...'); } catch (e) {}
+    const ref = db.collection('scheduledPosts').doc(id);
+    const res = await db.runTransaction(async (tx) => {
+      const d = await tx.get(ref);
+      if (!d.exists) return { gone: true };
+      const data = d.data();
+      const recurring = data.recurrence === 'daily' || data.recurrence === 'weekly';
+      if (recurring) return { data, claimed: false }; // next occurrence stays scheduled; just post now
+      if (data.status === 'failed' || data.status === 'pending') {
+        tx.set(ref, { status: 'sending', claimedAt: Date.now() }, { merge: true });
+        return { data, claimed: true };
+      }
+      return { data, blocked: data.status };
+    });
+    if (res.gone) return ctx.reply('❌ এই Schedule আর পাওয়া যাচ্ছে না।');
+    if (res.blocked) {
+      const msg = res.blocked === 'sent' ? '✅ এটা আগেই Post হয়ে গেছে।' : res.blocked === 'cancelled' ? '🚫 এই Schedule বাতিল করা হয়েছে।' : '⏳ এটা এখন Post হচ্ছে, একটু অপেক্ষা করুন।';
+      return ctx.reply(msg);
+    }
+    const sp = res.data;
+    const t = scheduledTimers.get(id);
+    if (t) { clearTimeout(t); scheduledTimers.delete(id); }
+    const channels = Array.isArray(sp.channels) && sp.channels.length ? sp.channels : (POST_CHANNEL ? [POST_CHANNEL] : []);
+    let out = { lines: [], saveEntries: [] };
+    try { out = await sendScheduledPostToChannels(sp, channels); }
+    catch (e) { out.lines.push(`❌ ${e.message}`); }
+    if (out.saveEntries.length) {
+      if (res.claimed) await ref.set({ status: 'sent', sentAt: Date.now(), result: out.lines, manual: true }, { merge: true }).catch(() => {});
+      let nowNote = '';
+      try { if (await releaseTopicNow(sp.topicId)) nowNote = '\n📺 Video এখন Mini App-এ প্রকাশ হয়েছে।'; } catch (e) {}
+      ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+      return ctx.reply(
+        `📤 Post সম্পন্ন হয়েছে\n\n🆔 Video/Topic ID: <code>${escapeHtml(String(sp.topicId || ''))}</code>\n\n${escapeHtml(out.lines.join('\n'))}${nowNote}`,
+        { parse_mode: 'HTML', reply_markup: postDoneMarkup(out.saveEntries) }
+      );
+    }
+    if (res.claimed) await ref.set({ status: 'failed', error: out.lines.join('\n').slice(0, 400) }, { merge: true }).catch(() => {});
+    return notifyScheduledPostFailed(id, sp, out.lines.join('\n'));
+  } catch (e) {
+    console.error('❌ schednow error:', e.message);
+    return ctx.reply('❌ Post করা যায়নি: ' + e.message).catch(() => {});
+  } finally {
+    manualPostBusy.delete(id);
+  }
+});
+
+// 🐕 Watchdog: ~2 minutes after a post was due, check it really went out. If it is still waiting/stuck
+// (queue stuck, DB error, anything unexpected) the admin gets the thumbnail + "Post Now" button.
+const postWatchdogs = new Map();
+const postFinished = new Set(); // in-memory only: docIds whose fire finished (sent or finally failed) -> watchdog needs NO read
+function armPostWatchdog(docId) {
+  if (postWatchdogs.has(docId)) return;
+  postFinished.delete(docId);
+  const h = setTimeout(async () => {
+    postWatchdogs.delete(docId);
+    // normal case: finished -> zero Firestore reads
+    if (postFinished.has(docId)) { postFinished.delete(docId); return; }
+    if (scheduledTimers.has(docId)) return;                                   // a retry is still counting down
+    if (postFireQueued.has(docId) || postFireQueue.includes(docId)) { armPostWatchdog(docId); return; } // still in the queue
+    try { // only now (something is wrong) do we read ONE doc
+      const d = await db.collection('scheduledPosts').doc(docId).get();
+      if (!d.exists) return;
+      const sp = d.data();
+      if (sp.status !== 'pending' && sp.status !== 'sending') return;
+      if (sp.status === 'pending' && Number(sp.scheduledAt) > Date.now()) return; // recurring: re-armed for the future = normal
+      await notifyScheduledPostFailed(docId, sp, 'নির্ধারিত সময়ের পরও Post যায়নি (status: ' + sp.status + ')');
+    } catch (e) { console.error('watchdog error:', e.message); }
+  }, 2 * 60 * 1000);
+  postWatchdogs.set(docId, h);
 }
 
 // Arms (or re-arms, in MAX_TIMEOUT_MS-sized chunks for far-future posts) an
@@ -7322,7 +7485,7 @@ function schedulePostTimer(docId, delayMs) {
   const remaining = delayMs - chunk;
   const handle = setTimeout(() => {
     if (remaining > 0) schedulePostTimer(docId, remaining);
-    else enqueuePostFire(docId);
+    else { enqueuePostFire(docId); armPostWatchdog(docId); }
   }, chunk);
   scheduledTimers.set(docId, handle);
 }
@@ -7334,7 +7497,7 @@ function schedulePostTimer(docId, delayMs) {
 // the post goes out POST_AFTER_VIDEO_MS after the video's publishAt, so the video is already visible
 // in the Mini App when people tap the channel post.
 const POST_AFTER_VIDEO_MS = 3000;
-const POST_FIRE_GAP_MS = 1300;
+const POST_FIRE_GAP_MS = 3200; // Telegram allows ~20 msgs/min per channel -> keep under it
 const postFireQueue = [];
 const postFireQueued = new Set();
 let postFireRunning = false;
@@ -7362,11 +7525,13 @@ async function runPostFireQueue() {
 // the ONLY bulk Firestore read this feature does under normal operation.
 (async function recoverScheduledPosts() {
   try {
-    const snap = await db.collection('scheduledPosts').where('status', '==', 'pending').get();
     const now = Date.now();
+    // ONE query: pending posts + posts that were mid-send when the server restarted (same read cost as before).
+    const snap = await db.collection('scheduledPosts').where('status', 'in', ['pending', 'sending']).get();
     snap.docs.forEach(doc => {
       const scheduledAt = Number(doc.data().scheduledAt) || 0;
-      if (scheduledAt <= now) enqueuePostFire(doc.id, 0);
+      if (doc.data().status === 'sending') doc.ref.set({ status: 'pending' }, { merge: true }).catch(() => {}); // rare: only after a crash
+      if (scheduledAt <= now) { enqueuePostFire(doc.id, 0); armPostWatchdog(doc.id); }
       else schedulePostTimer(doc.id, scheduledAt - now);
     });
   } catch (error) {
