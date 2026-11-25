@@ -6409,9 +6409,16 @@ async function notifyVipViaPaymentBot(userId, expiry) {
     const text = lang === 'en'
       ? `🎉 Congrats! Your VIP has been activated.\n\n⏰ Expires: ${dateStr}\n\nGo enjoy every video ad-free on Premium Video! 👑`
       : `🎉 অভিনন্দন! আপনার VIP Activate করা হয়েছে।\n\n⏰ মেয়াদ শেষ হবে: ${dateStr}\n\nএখন Premium Video app-এ গিয়ে কোনো Ad ছাড়াই সব ভিডিও দেখতে পারবেন! 👑`;
+    // 🚀 same "Open Mini App" button the Payment bot puts on its own confirmations (link set in Payment bot admin panel)
+    let replyMarkup;
+    try {
+      const cs = await db.collection('paymentPackages').doc('config').get();
+      const link = cs.exists ? String(cs.data().appLink || '') : '';
+      if (link) replyMarkup = { inline_keyboard: [[{ text: lang === 'en' ? '🚀 Open Mini App' : '🚀 Mini App খুলুন', url: link }]] };
+    } catch (_) { /* button is optional */ }
     const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chat_id: String(userId), text })
+      body: JSON.stringify({ chat_id: String(userId), text, reply_markup: replyMarkup })
     });
     const j = await r.json().catch(() => ({}));
     if (r.ok && j.ok) return '📨 Payment bot থেকে user-কে মেসেজ পাঠানো হয়েছে।';
