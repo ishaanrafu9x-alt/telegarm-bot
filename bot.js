@@ -263,7 +263,7 @@ function sanitizeApp(o) {
   if (typeof o.welcome === 'string') c.welcome = o.welcome.slice(0, 800);
   if (typeof o.offerOn === 'boolean') c.offerOn = o.offerOn;
   if (typeof o.autoDigest === 'boolean') c.autoDigest = o.autoDigest;
-  if (typeof o.holdNew === 'boolean') c.holdNew = o.holdNew;
+  c.holdNew = false; // 🙈 video-hide system removed
   for (const k of ['offerTitle', 'offerText', 'offerCode']) if (typeof o[k] === 'string') c[k] = o[k].slice(0, k === 'offerText' ? 300 : 60);
   const ou = Number(o.offerUntil);
   if (Number.isFinite(ou) && ou >= 0) c.offerUntil = ou;
@@ -354,8 +354,7 @@ function appSettingsView() {
     `👋 Welcome Message: ${a.welcome ? 'Custom' : 'Default'}\n` +
     `👑 VIP কেনার লিংক: ${a.vipUrl || '— (নেই, বাটন লুকানো)'}\n` +
     `🎁 Offer Card: ${st(a.offerOn)}${a.offerTitle ? '\n    "' + safeTruncate(a.offerTitle, 50) + '"' + (a.offerCode ? ' · কোড ' + a.offerCode : '') + (a.offerUntil ? ' · শেষ ' + formatDhakaDateTime(a.offerUntil) : '') : ''}\n` +
-    `🔔 নতুন video Auto-Notify (রাত ৮টা): ${st(a.autoDigest)}\n` +
-    `🙈 নতুন upload Post না হওয়া পর্যন্ত লুকানো: ${st(a.holdNew)}`;
+    `🔔 নতুন video Auto-Notify (রাত ৮টা): ${st(a.autoDigest)}`;
   const T = (label, key) => Markup.button.callback(`${a[key] ? '🟢' : '🔴'} ${label}`, `adm_cfg_tgl_${key}`);
   const keyboard = Markup.inlineKeyboard([
     [T('Banner', 'announceOn'), Markup.button.callback('✏️ Banner লিখুন', 'adm_cfg_txt_announce')],
@@ -365,7 +364,6 @@ function appSettingsView() {
     [Markup.button.callback('👋 Welcome Message', 'adm_cfg_txt_welcome'), Markup.button.callback('👑 VIP লিংক', 'adm_cfg_txt_vipUrl')],
     [T('Offer Card', 'offerOn'), Markup.button.callback('🎁 Offer সেট করুন', 'adm_cfg_offer')],
     [T('Auto-Notify', 'autoDigest'), Markup.button.callback('🔔 Subscribers / এখনই পাঠান', 'adm_cfg_digest')],
-    [T('নতুন Video লুকানো (Post পর্যন্ত)', 'holdNew')],
     [Markup.button.callback('⬅️ Back', 'adm_home')]
   ]);
   return { text, keyboard };
@@ -496,7 +494,6 @@ async function shouldLinkVideoDefault(topicId) {
 }
 function schedRepeatKeyboard(state) {
   return Markup.inlineKeyboard([
-    [Markup.button.callback(`📺 Video-ও এই সময়ে প্রকাশ: ${state.linkVideo ? '✅ হ্যাঁ' : '❌ না'}  (বদলাতে চাপুন)`, 'sched_link')],
     [Markup.button.callback('✅ Schedule সেভ করুন — একবারই', 'sched_repeat:none')],
     [Markup.button.callback('🔁 সেভ করুন — প্রতিদিন (Daily)', 'sched_repeat:daily')],
     [Markup.button.callback('🔁 সেভ করুন — প্রতি সপ্তাহে (Weekly)', 'sched_repeat:weekly')]
@@ -752,14 +749,11 @@ async function rebuildTopicsIndex() {
   // returning an empty list. Build each card from an explicit allow-list
   // instead — only what the webapp card UI actually reads.
   const nowTs = Date.now();
-  topics.forEach(t => { if (Number(t.publishAt) > nowTs) armPublishTimer(t.id, Number(t.publishAt)); });
   const isHiddenTopic = (t) => Number(t.publishAt) > nowTs || t.held === true;
   // ⏱️ The index now carries hidden/scheduled cards too, marked with `held` / `publishAt`. The Cloudflare
   // Worker filters them out per request against ITS clock — so a scheduled video appears at exactly its time
   // even if this Render bot is asleep or restarted (no timer, no rebuild needed to reveal it).
   const cards = topics.map(t => ({
-    ...(t.held === true ? { held: true } : {}),
-    ...(Number(t.publishAt) > nowTs ? { publishAt: Number(t.publishAt) } : {}),
     id: t.id,
     title: t.title || '',
     thumbnail: t.thumbnail || '',
@@ -3078,23 +3072,7 @@ bot.action(/^sched_repeat:(none|daily|weekly)$/, async (ctx) => {
     });
     delete postData[userId];
     schedulePostTimer(docRef.id, parsed - Date.now());
-    let linkedNote = '\n📺 Video এখনই Mini App-এ দেখা যাচ্ছে।';
-    // link OFF: leave the video exactly as it is. A hidden video stays hidden and is released automatically
-    // when this scheduled post actually goes out (see the release after the scheduled send).
-    if (!state.linkVideo && state.topicId) {
-      try {
-        const td = await db.collection('topics').doc(String(state.topicId)).get();
-        if (td.exists && td.data().held === true) linkedNote = '\n🙈 Video লুকানো থাকবে — Channel-এ Post যাওয়ার সাথে সাথে Mini App-এ আসবে।';
-      } catch (e) {}
-    }
-    if (state.linkVideo && state.topicId) {
-      try {
-        await db.collection('topics').doc(String(state.topicId)).set({ publishAt: parsed, held: admin.firestore.FieldValue.delete() }, { merge: true });
-        patchTopicCache(state.topicId, { publishAt: parsed, held: undefined });
-        armPublishTimer(String(state.topicId), parsed);
-        linkedNote = '\n📺 Video-ও এই সময়েই Mini App-এ প্রকাশ হবে (তার আগে লুকানো)।';
-      } catch (e) { console.error('link video schedule failed:', e.message); linkedNote = '\n⚠️ Video schedule করা যায়নি — video আগের মতোই দেখা যাবে।'; }
-    }
+    const linkedNote = '';
     const repeatLabel = recurrence === 'daily' ? '\n🔁 প্রতিদিন এই সময়ে repeat হবে (বাতিল না করা পর্যন্ত)।'
       : recurrence === 'weekly' ? '\n🔁 প্রতি সপ্তাহে এই সময়ে repeat হবে (বাতিল না করা পর্যন্ত)।'
       : '';
@@ -3780,8 +3758,6 @@ bot.action(/^adm_(.+)$/, async (ctx) => {
       [Markup.button.callback('🖼️ Thumbnail Edit', 'adm_video_thumb')],
       [Markup.button.callback('🗑️ Delete Video', 'adm_video_delete')],
       [Markup.button.callback('🗂️ Bulk Select (Delete/Ads)', 'adm_bulk_topics')],
-      [Markup.button.callback('🙈 Hidden / Scheduled Videos', 'hv_list')],
-      [Markup.button.callback('⏰ Publish Schedule', 'adm_vsched')],
       [Markup.button.callback('⬅️ Back', 'adm_home')]
     ]));
   }
@@ -5480,7 +5456,7 @@ bot.on('text', async (ctx) => {
       }
       state.scheduleTime = parsed;
       state.step = 'schedule_repeat';
-      try { state.linkVideo = await shouldLinkVideoDefault(state.topicId); } catch (e) { state.linkVideo = false; }
+      state.linkVideo = false;
       if (state.saveReminder) clearTimeout(state.saveReminder);
       state.saveReminder = setTimeout(() => {
         if (postData[userId] === state && state.step === 'schedule_repeat' && ADMIN_ID) {
@@ -5488,7 +5464,7 @@ bot.on('text', async (ctx) => {
         }
       }, 90 * 1000);
       return ctx.reply(
-        `📅 সময়: ${formatDhakaDateTime(parsed)}\n\n📺 "Video-ও এই সময়ে প্রকাশ: হ্যাঁ" থাকলে video Mini App-এ ঠিক এই সময়েই আসবে (তার আগে লুকানো থাকবে)। যে video আগেই চালু (আগে কেউ unlock করেছে), সেটা আবার post করলে "না" থাকে।\n\n🔁 এটা কি বারবার (repeat) post হবে, নাকি একবারই?\n\n⚠️ নিচে "সেভ করুন" বাটন না চাপলে Schedule হবে না!`,
+        `📅 সময়: ${formatDhakaDateTime(parsed)}\n\n🔁 এটা কি বারবার (repeat) post হবে, নাকি একবারই?\n\n⚠️ নিচে "সেভ করুন" বাটন না চাপলে Schedule হবে না!`,
         schedRepeatKeyboard(state)
       );
     }
@@ -6265,7 +6241,6 @@ app.get('/api/topic/:topicId', async (req, res) => {
     // share one Firestore read instead of creating hundreds/thousands of reads.
     const topic = await getSingleTopicCached(topicId);
     if (!topic) return res.status(404).json({ error: 'Topic not found' });
-    if (topic.held === true || Number(topic.publishAt) > Date.now()) return res.status(404).json({ error: 'Topic not found' });
 
     // 🔒 The cache entry now also carries `videos` (raw Telegram file_ids) so
     // the delivery path can reuse it instead of a second Firestore read —
@@ -6289,7 +6264,7 @@ app.get('/api/topics', async (req, res) => {
     // reach the Mini App. Checked against the clock on every request, so a video appears by itself
     // the moment its publishAt passes — no timer or cache refresh needed.
     const nowTs = Date.now();
-    const visible = topics.filter(t => !(Number(t.publishAt) > nowTs) && t.held !== true);
+    const visible = topics;
     const cards = visible.map(({ videos, publishAt, held, ...topic }) => ({
       ...topic,
       videoCount: topic.videoCount || (Array.isArray(videos) ? videos.length : 0)
